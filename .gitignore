@@ -1,0 +1,9 @@
+MacKernelSDK/
+build/
+DerivedData/
+
+# Local captures contain device firmware and machine-specific diagnostic data.
+VFCT.bin
+amdgpu-boot-log.txt
+modetest.txt
+pci-gpu.txt
