@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>SteamDeckintosh</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.steamdeckintosh.probe</string>
+	<string>com.steamdeckintosh.vangogh</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -24,6 +24,8 @@
 	<dict>
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>1.0.0</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>1.0.0</string>
 		<key>com.apple.kpi.iokit</key>
 		<string>8.0.0</string>
 		<key>com.apple.kernel.libkern</key>
@@ -31,20 +33,34 @@
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>
-		<key>SteamDeckVanGoghProbe</key>
+		<key>VanGoghGPU</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.steamdeckintosh.probe</string>
+			<string>com.steamdeckintosh.vangogh</string>
 			<key>IOClass</key>
-			<string>SteamDeckintoshProbe</string>
+			<string>VanGoghDriver</string>
 			<key>IOPCIMatch</key>
 			<string>0x163F1002</string>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOMatchCategory</key>
-			<string>com.steamdeckintosh.probe</string>
-			<key>IOProbeScore</key>
-			<integer>0</integer>
+			<string>com.steamdeckintosh.vangogh</string>
+		</dict>
+		<key>VanGoghFramebuffer</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.steamdeckintosh.vangogh</string>
+			<key>IOClass</key>
+			<string>VanGoghFramebuffer</string>
+			<key>IOProviderClass</key>
+			<string>VanGoghDriver</string>
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>VanGoghFramebuffer,ready</key>
+				<true/>
+			</dict>
 		</dict>
 	</dict>
 </dict>

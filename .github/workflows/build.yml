@@ -1,4 +1,4 @@
-name: Build probe kext
+name: Build Van Gogh driver kext
 
 on:
   push:
@@ -15,11 +15,11 @@ jobs:
       - name: Fetch MacKernelSDK headers and kmod library
         run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
 
-      - name: Build unsigned x86_64 diagnostic kext
+      - name: Build unsigned x86_64 Van Gogh driver kext
         run: xcodebuild -project SteamDeckintosh.xcodeproj -target SteamDeckintosh -configuration Debug -sdk macosx -arch x86_64 SYMROOT=build CODE_SIGNING_ALLOWED=NO build
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SteamDeckintosh-probe-kext
+          name: SteamDeckintosh-VanGogh-driver-kext
           path: build/Debug/SteamDeckintosh.kext
