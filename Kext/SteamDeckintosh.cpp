@@ -148,15 +148,21 @@ bool VanGoghDriver::start(IOService *provider) {
           (unsigned long long)m_registerLength);
     IOLog("VanGoghDriver: GPU initialization and display/compute services are not enabled yet\n");
 
-    m_pciDevice->setProperty("model", "AMD 0405");
+    m_pciDevice->setProperty("model", "AMD Van Gogh (Steam Deck)");
+    m_pciDevice->setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
+    m_pciDevice->setProperty("VanGoghDriver,PCI-device-id", device, 32);
+    m_pciDevice->setProperty("VanGoghDriver,revision-id", revision, 8);
     const UInt32 vramMegabytes = 4096;
-    OSData *vramProperty = OSData::withBytes(&vramMegabytes, sizeof(vramMegabytes));
-    if (vramProperty != nullptr) {
-        m_pciDevice->setProperty("VRAM,totalMB", vramProperty);
-        vramProperty->release();
-    }
+    m_pciDevice->setProperty("VRAM,totalMB", vramMegabytes, 32);
+    m_pciDevice->setProperty("VanGoghDriver,VRAM-MiB", vramMegabytes, 32);
+    IOLog("VanGoghDriver: GPU AMD Van Gogh (Steam Deck), PCI %04x:%04x, %u MiB shared VRAM\n",
+          vendor, device, vramMegabytes);
 
     setProperty("model", "AMD Van Gogh Integrated Graphics");
+    setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
+    setProperty("VanGoghDriver,PCI-device-id", device, 32);
+    setProperty("VanGoghDriver,revision-id", revision, 8);
+    setProperty("VanGoghDriver,VRAM-MiB", vramMegabytes, 32);
     setProperty("VanGoghDriver,register-aperture-size",
                 (UInt64)m_registerLength, 64);
     loadIPDiscovery(m_pciDevice);
@@ -473,7 +479,13 @@ void VanGoghDriver::applyConfiguredDCN301Rotation(IOService *provider) {
         requestedMask = mask->unsigned32BitValue();
         requestedAngle = angleProperty->unsigned32BitValue();
     } else {
+        // The user requested the captured Deck panel rotation. Use only the
+        // HUBPs resolved from the active panel's OTG/ODM/MPCC path; never
+        // guess from a fixed instance number.
         requestedMask = m_panelHUBPMask;
+        requestedAngle = 3;
+        IOLog("VanGoghDriver: applying detected 270-degree panel rotation to HUBP mask %x\n",
+              requestedMask);
     }
     if (requestedMask == 0) {
         IOLog("VanGoghDriver: no HUBP surfaces were linked to the active internal-panel OPP; skipping rotation\n");
