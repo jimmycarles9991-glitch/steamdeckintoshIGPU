@@ -1,27 +1,36 @@
-# SteamDeckintosh
+# Steam Deckintosh
 
-Experimental macOS graphics-driver research for the AMD Van Gogh iGPU in the Steam Deck (PCI vendor/device ID `1002:163F`).
+Experimental macOS graphics-driver development for the AMD Van Gogh iGPU in the Steam Deck (PCI ID `1002:163F`).
 
-## Status
+## Current driver state
 
-The first source target is a diagnostic probe kext. It matches PCI ID `1002:163F`, logs the PCI vendor/device/revision when I/O Kit attaches it, and does not touch GPU registers. It does **not** set up the framebuffer, initialize the GPU, provide acceleration, or make the built-in panel work. Because it binds to the PCI device, do not load it on a system you rely on until testing in a recoverable setup; it may affect another driver that matches the same device.
+The kext now uses a `VanGoghDriver` PCI service. It validates the matched PCI ID, opens the PCI provider, enables PCI memory decoding as needed, and maps BAR5 using the OS-published resource length. It restores the prior memory-decoding state and releases the mapping on startup failure or detach. It publishes `AMD 0405` and `VRAM,totalMB = 4096` from the Steam Deck hardware captures. A bounded 32-bit MMIO accessor is in place for later hardware stages.
 
-The GitHub Actions workflow builds an unsigned x86_64 bundle on a macOS runner and uploads it as an artifact. This Linux workspace cannot run Apple's `xcodebuild`, and the workflow has not run until this folder is pushed to a GitHub repository. The local `VFCT.bin` is a hardware diagnostic dump, not a macOS driver resource.
+This is not a working graphics stack yet. The PCI driver waits for PSP IFWI-ready, reads VRAM size, copies and validates the AMD IP discovery TMR through the BAR5 `MM_INDEX/MM_DATA` window, and validates optional PSP ASD/TOC containers without submitting them. It reads live MMHUB VMID0 and DCN301 HUBP, OTG, ODM, and MPCC state. For rotation, it matches the internal panel's captured OTG totals, follows the corresponding OPP's active MPCC inputs, and requests 270 degrees on the resulting HUBP surfaces; the Linux capture resolves to HUBP0 and HUBP3. The kext owns a physically contiguous 1280x800 ARGB source buffer, but does not yet have a GPUVM mapping for it. The framebuffer remains guarded until the GPU address is mapped and the HUBP surface, clocks, and eDP stream are programmed and verified. The EDID path only forwards the Deck panel's captured EDID; it does not implement AUX/DDC hardware. Mode changes and backlight control are not implemented. No kext build or load has been verified on macOS. A complete Van Gogh GMC/VM and DCN pipe/eDP bring-up sequence is still required.
 
-Van Gogh is an RDNA 2 integrated GPU, and this project has no functioning macOS graphics stack for it. Full support would require GPU initialization, memory management, display-engine/framebuffer support, power management, and acceleration, plus testing on the Steam Deck. A device-ID match alone cannot supply that functionality.
+## Try rotating the currently active macOS display
 
-## Development notes
+The framebuffer transform helper requests a 270-degree rotation on the currently active built-in macOS display and waits for CoreGraphics to report the new orientation. This tests the macOS display transform independently of this kext. On macOS, from the repository root:
 
-- The probe targets Intel x86_64 and macOS 12 or later as a starting build target. The precise macOS version must be confirmed before attempting to load it.
-- A successful GitHub build only proves that Xcode produced a bundle. It does not prove the bundle can be loaded, safely bind to the GPU, or work on the Deck.
-- Keep this work separate from third-party driver source unless its license explicitly permits the intended use. This project currently contains no copied or adapted third-party implementation.
-- Do not install this placeholder in OpenCore. It has no executable and cannot drive the GPU.
+```sh
+clang -Wall -Wextra -framework IOKit -framework ApplicationServices tools/rotate_display.c -o /tmp/rotate-display
+/tmp/rotate-display 270
+```
 
-## Planned work
+Restore the normal orientation with `/tmp/rotate-display 0`. The helper targets the built-in display and returns failure if CoreGraphics does not confirm the requested orientation within two seconds. This exercises macOS's active framebuffer transform; it does not test Van Gogh DCN initialization or this kext's guarded framebuffer service.
 
-1. Run the GitHub Actions workflow to confirm the probe compiles.
-2. Confirm the exact macOS release and boot setup before any load attempt. Kernel extensions are deprecated by Apple, and load policy varies by macOS release and security configuration.
-3. Investigate Van Gogh initialization, memory management, display output, power management, and acceleration requirements. Linux's `amdgpu` initialization is a reference for the hardware sequence, not a macOS implementation.
-4. Only after a safe probe test, develop and validate driver pieces incrementally on recoverable hardware.
+When loaded, the kext binds to the GPU and maps its register aperture. It may claim the PCI service and contend with another matching driver. Load it only on a recoverable macOS setup after building and reviewing the artifact. BAR addresses are runtime assigned; the driver discovers them through IOPCIFamily.
 
-There is no working implementation or timeline yet.
+## Build
+
+GitHub Actions builds an unsigned x86_64 bundle on a macOS runner and uploads it as an artifact. This Linux workspace cannot run Apple's `xcodebuild`. The workflow has not run until the project is pushed to a GitHub repository.
+
+The local `VFCT.bin` is a hardware diagnostic dump, not a macOS driver resource. Do not install the current driver in OpenCore expecting graphics support.
+
+## Linux research tools
+
+- `python3 tools/linux_ip_inventory.py [PCI-BDF]` prints OS-assigned PCI resource ranges and numeric IP discovery entries from sysfs. It is read-only and does not require root.
+- `tools/parse_ip_discovery.py BINARY --compare-sysfs PCI-BDF` validates an `amdgpu_discovery` blob's signatures, checksums, table and die bounds, then compares parsed entries with sysfs. Capturing the blob from Linux debugfs requires root; parsing a saved file does not.
+- `python3 tools/linux_resolve_ip_register.py HWID INSTANCE BASE_IDX REGISTER_DWORD` calculates a direct BAR5 address from the live table and checks its full 4-byte range. Supply the base index and register dword from headers matching that IP version. It never maps or reads the register and refuses candidates outside BAR5.
+
+Van Gogh is RDNA 2 (`gfx1033`), with GC `10.3.1`, PSP/SMU `11.5.0`, SDMA `5.2.1`, and DCN `3.0.1`. `nullarc-main` targets Phoenix/Hawk Point RDNA 3; its staged development pattern is useful, while its firmware, IP registers, memory setup, and display implementation do not apply to Van Gogh. See [hardware notes](hardware-notes.md) for the source trace, live captures, and mapping limits.
