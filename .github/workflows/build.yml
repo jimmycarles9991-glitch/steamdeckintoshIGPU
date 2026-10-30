@@ -1,0 +1,25 @@
+name: Build probe kext
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - name: Check out SteamDeckintosh
+        uses: actions/checkout@v4
+
+      - name: Fetch MacKernelSDK headers and kmod library
+        run: git clone --depth 1 https://github.com/acidanthera/MacKernelSDK.git MacKernelSDK
+
+      - name: Build unsigned x86_64 diagnostic kext
+        run: xcodebuild -project SteamDeckintosh.xcodeproj -scheme SteamDeckintosh -configuration Debug -sdk macosx -derivedDataPath build CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteamDeckintosh-probe-kext
+          path: build/Build/Products/Debug/SteamDeckintosh.kext
