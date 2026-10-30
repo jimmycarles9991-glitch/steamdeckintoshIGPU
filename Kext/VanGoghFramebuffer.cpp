@@ -4,7 +4,6 @@
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
-#include <limits.h>
 #include <string.h>
 
 // This is the registry-facing framebuffer contract. It deliberately starts
