@@ -6,7 +6,6 @@ constexpr uint32_t kBinarySignature = 0x28211407;
 constexpr uint32_t kIPTableSignature = 0x53445049;
 constexpr size_t kBinaryHeaderSize = 12 + 6 * 8;
 constexpr size_t kIPHeaderFixedSize = 14 + 16 * 4 + 2;
-constexpr size_t kMaxBinarySize = 1024 * 1024;
 
 bool rangeFits(size_t offset, size_t size, size_t limit) {
     return offset <= limit && size <= limit - offset;
@@ -46,7 +45,6 @@ bool parse(const uint8_t *data, size_t length, Table *table) {
         !read16(data, length, 8, &expectedBinaryChecksum) ||
         !read16(data, length, 10, &binarySize) ||
         binarySize < kBinaryHeaderSize || binarySize > length ||
-        binarySize > kMaxBinarySize ||
         checksum16(data, 10, binarySize - 10) != expectedBinaryChecksum) {
         return false;
     }
