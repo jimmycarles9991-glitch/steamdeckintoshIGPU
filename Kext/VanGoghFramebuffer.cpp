@@ -82,7 +82,6 @@ bool VanGoghFramebuffer::start(IOService *provider) {
     const bool rotationProgrammed = (rotation == kOSBooleanTrue);
     if (ready != kOSBooleanTrue || linearScanout != kOSBooleanTrue ||
         gpuAddressMapped != kOSBooleanTrue || surfaceProgrammed != kOSBooleanTrue ||
-        !rotationProgrammed ||
         !readNumber(provider, "VanGoghFramebuffer,scanout-physical", &physical) ||
         !readNumber(provider, "VanGoghFramebuffer,scanout-bytes", &bytes) ||
         !readNumber(provider, "VanGoghFramebuffer,width", &width) ||
@@ -103,8 +102,13 @@ bool VanGoghFramebuffer::start(IOService *provider) {
         IOLog("VanGoghFramebuffer: refusing invalid scanout geometry or range\n");
         return false;
     }
-    if (width != 1280 || height != 800 || refresh != 60) {
-        IOLog("VanGoghFramebuffer: rotated Deck mode requires a 1280x800@60 source surface\n");
+    // Two scanout shapes: a 1280x800 source the HUBP rotates 270 degrees to the
+    // portrait panel, or a native 800x1280 surface with no rotation.
+    const bool landscapeRotated = (width == 1280 && height == 800 && rotationProgrammed);
+    const bool nativePortrait = (width == 800 && height == 1280 && !rotationProgrammed);
+    if ((!landscapeRotated && !nativePortrait) || refresh != 60) {
+        IOLog("VanGoghFramebuffer: unsupported scanout %llux%llu@%llu (rotation %d)\n",
+              width, height, refresh, rotationProgrammed ? 1 : 0);
         return false;
     }
 
@@ -120,7 +124,7 @@ bool VanGoghFramebuffer::start(IOService *provider) {
     // the 800x1280 eDP mode (DRM ROTATE_270; HUBP angle 3). Buffer address,
     // tiling, and DCC state are runtime-owned and must come from the parent.
     // Advertise rotation only after the parent confirms it programmed DCN.
-    m_rotationSupported = true;
+    m_rotationSupported = rotationProgrammed;
 
     // Only forward a real EDID supplied by the panel/AUX bring-up code.
     // Validate the header, declared extension count, and each 128-byte checksum.
@@ -229,16 +233,18 @@ IOReturn VanGoghFramebuffer::getTimingInfoForDisplayMode(
     IODisplayModeID mode, IOTimingInformation *info) {
     if (!info || mode != 1 || !m_scanoutReady) return kIOReturnUnsupportedMode;
     bzero(info, sizeof(*info));
-    if (!m_rotationSupported) return kIOReturnUnsupportedMode;
 
     // Deck eDP mode from the live KMS capture: 800x1280@60, totals 872x1324,
-    // 69.270 MHz. The source framebuffer is 1280x800 and DCN rotates it 270°.
+    // 69.270 MHz. In rotated mode the source is 1280x800 and DCN rotates it
+    // 270 degrees; in native mode the surface already matches the panel.
     info->appleTimingID = kIOTimingIDInvalid;
-    info->flags = kIODetailedTimingValid | kIOScalingInfoValid;
+    info->flags = kIODetailedTimingValid | (m_rotationSupported ? kIOScalingInfoValid : 0);
     IODetailedTimingInformationV2 *timing = &info->detailedInfo.v2;
-    timing->scalerFlags = kIOScaleRotate270;
-    timing->horizontalScaled = m_width;
-    timing->verticalScaled = m_height;
+    if (m_rotationSupported) {
+        timing->scalerFlags = kIOScaleRotate270;
+        timing->horizontalScaled = m_width;
+        timing->verticalScaled = m_height;
+    }
     timing->signalConfig = kIODigitalSignal;
     timing->pixelClock = 69270000;
     timing->horizontalActive = 800;

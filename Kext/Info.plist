@@ -39,8 +39,10 @@
 			<string>com.steamdeckintosh.vangogh</string>
 			<key>IOClass</key>
 			<string>VanGoghDriver</string>
-			<key>IOPCIMatch</key>
+			<key>IOPCIPrimaryMatch</key>
 			<string>0x163F1002</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOMatchCategory</key>
