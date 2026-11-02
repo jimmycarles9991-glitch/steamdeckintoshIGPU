@@ -19,8 +19,13 @@ enum class Register : uint8_t {
     SurfaceAddressHigh,
     SurfaceControl,
     VmidSettings,
-    HubpControl
+    HubpControl,
+    // Appended after HubpControl: the live-state readback loop walks
+    // TilingConfig..HubpControl only and must not pick these up.
+    FlipControl,
+    AddrConfig
 };
+constexpr uint8_t kRegisterCount = 11;
 
 struct SurfaceState {
     uint32_t valid;

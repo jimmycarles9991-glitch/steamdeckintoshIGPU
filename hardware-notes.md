@@ -2,6 +2,12 @@
 
 Collected from the Linux system visible to this workspace on 2026-10-30. These identify the target; they are not a macOS framebuffer configuration.
 
+## Supplemental live snapshot (2026-11-02)
+
+Read-only sysfs checks on the current Steam Deck confirm the target is still PCI `1002:163F`, revision `0xAE`, with Linux `amdgpu` bound. The driver reports 4 GiB VRAM total and about 897 MiB in use at capture time. OS-assigned resources currently are BAR0 `0xF8E0000000–0xF8EFFFFFFF` (256 MiB), BAR2 `0xF8F0000000–0xF8F01FFFFF` (2 MiB), and BAR5 `0x80300000–0x8037FFFF` (512 KiB). These are runtime values, not constants for the kext. The read-only `tools/linux_ip_inventory.py 0000:04:00.0` again parsed 36 IP discovery entries, including GC 10.3.1, MMHUB 2.3.0, and DCN 3.0.1. The built-in `eDP-1` connector is connected and enabled. Debugfs is not readable in this user session, so no new register-level pipe or GPUVM capture was available; the older debugfs captures above remain the detailed display-state evidence.
+
+This refresh is useful as a current hardware sanity check, but it does not advance the macOS bring-up sequence: no GPUVM mapping, firmware submission, or DCN programming was attempted.
+
 ## GPU
 
 - System: Valve Steam Deck, board/product `Jupiter`, BIOS `F7A0131`.

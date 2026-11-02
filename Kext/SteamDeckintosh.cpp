@@ -8,6 +8,10 @@
 #include "VanGoghDCN301.h"
 #include "VanGoghFirmware.h"
 #include "VanGoghIPDiscovery.h"
+#include "VanGoghMemoryPlan.h"
+#include "VanGoghScanout.h"
+#include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSNumber.h>
 
 namespace {
 constexpr UInt32 kPciConfigCommandRegister = 0x04;
@@ -24,6 +28,12 @@ constexpr UInt32 kBinarySignature = 0x28211407;
 constexpr UInt64 kDiscoveryTmrOffset = 64 * 1024;
 constexpr UInt32 kDiscoveryTmrSize = 10 * 1024;
 constexpr UInt32 kMaxDiscoverySize = 64 * 1024;
+// MMHUB 2.3.0 (discovery HWID 34), base segment 1. Checked against Linux's
+// mmhub_2_3_0_offset.h by tools/verify_dcn301_registers.py.
+constexpr UInt16 kMmhubHwId = 34;
+constexpr UInt8 kMmhubSegment = 1;
+constexpr UInt32 kMcVmFbLocationBase = 0x08ec;
+constexpr UInt32 kMcVmFbLocationTop = 0x08ed;
 constexpr UInt32 kPanelSourceWidth = 1280;
 constexpr UInt32 kPanelSourceHeight = 800;
 constexpr UInt32 kPanelSourcePitch = kPanelSourceWidth * 4;
@@ -35,6 +45,7 @@ class VanGoghDriver : public IOService {
     OSDeclareDefaultStructors(VanGoghDriver)
 
 public:
+    IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
 
@@ -45,6 +56,17 @@ private:
     void inspectDCN301PipeRouting();
     void inspectVanGoghVMID0();
     bool allocatePanelScanout();
+    // Opt-in VRAM scanout route (see README). Each stage needs its own
+    // provider/personality property and nothing below runs by default.
+    bool boolProperty(IOService *provider, const char *key) const;
+    bool numberProperty(IOService *provider, const char *key, UInt64 *value) const;
+    void planVramScanout(IOService *provider);
+    bool writeVramPattern();
+    void programVramScanout(IOService *provider);
+    bool applyPlane(UInt8 hubp, const VanGoghScanout::PlaneImage &image, UInt32 flipControl);
+    void restoreVramScanout(bool force);
+    bool readHubpRegister(UInt8 hubp, VanGoghDCN301::Register reg, UInt32 *value) const;
+    bool writeHubpRegister(UInt8 hubp, VanGoghDCN301::Register reg, UInt32 value) const;
     void applyConfiguredDCN301Rotation(IOService *provider);
     bool programDCN301Rotation(UInt8 hubp, UInt8 angle);
     void validatePSPFirmware(IOService *provider);
@@ -75,12 +97,47 @@ private:
     UInt32 m_panelHUBPMask{0};
     UInt32 m_rotationOriginalConfig[VanGoghDCN301::kHUBPCount]{};
     UInt32 m_rotationProgrammedConfig[VanGoghDCN301::kHUBPCount]{};
+
+    struct ScanoutRestore {
+        VanGoghScanout::Baseline original;
+        UInt32 originalAddressLow;
+        UInt32 originalAddressHigh;
+        VanGoghScanout::PlaneImage programmed;
+    };
+    IOMemoryMap *m_vramWindowMap{nullptr};
+    IOPhysicalAddress m_bar0Physical{0};
+    VanGoghMemoryPlan::Output m_vramPlan{};
+    VanGoghScanout::Geometry m_geom{};
+    bool m_vramPatternWritten{false};
+    UInt32 m_scanoutRestoreMask{0};
+    ScanoutRestore m_scanoutRestore[VanGoghDCN301::kHUBPCount]{};
 };
 
 OSDefineMetaClassAndStructors(VanGoghDriver, IOService)
 
+IOService *VanGoghDriver::probe(IOService *provider, SInt32 *score) {
+    IOService *matched = IOService::probe(provider, score);
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, matched);
+    if (pci == nullptr) {
+        IOLog("VanGoghDriver: probe rejected non-PCI provider\n");
+        return nullptr;
+    }
+
+    const UInt16 vendor = pci->configRead16(kIOPCIConfigVendorID);
+    const UInt16 device = pci->configRead16(kIOPCIConfigDeviceID);
+    if (vendor != 0x1002 || device != 0x163F) {
+        IOLog("VanGoghDriver: probe rejected PCI %04x:%04x\n", vendor, device);
+        return nullptr;
+    }
+    if (score != nullptr) *score = 1000;
+    IOLog("VanGoghDriver: probe matched Steam Deck Van Gogh %04x:%04x\n", vendor, device);
+    return matched;
+}
+
 bool VanGoghDriver::start(IOService *provider) {
+    IOLog("VanGoghDriver: start entered\n");
     if (!IOService::start(provider)) {
+        IOLog("VanGoghDriver: IOService::start failed\n");
         return false;
     }
 
@@ -98,6 +155,25 @@ bool VanGoghDriver::start(IOService *provider) {
         m_pciDevice = nullptr;
         IOService::stop(provider);
         return false;
+    }
+
+    // A zero-I/O path for confirming OpenCore injection, PCI matching, and
+    // IOKit service publication before enabling any BAR or GPU access.
+    if (boolProperty(m_pciDevice, "VanGoghDriver,probe-only")) {
+        const UInt8 revision = m_pciDevice->configRead8(kIOPCIConfigRevisionID);
+        setProperty("model", "AMD Van Gogh (Steam Deck) probe-only");
+        setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
+        setProperty("VanGoghDriver,PCI-device-id", device, 32);
+        setProperty("VanGoghDriver,revision-id", revision, 8);
+        setProperty("VanGoghDriver,attached", true);
+        setProperty("VanGoghDriver,probe-only", true);
+        m_pciDevice->setProperty("model", "AMD Van Gogh (Steam Deck) probe-only");
+        m_pciDevice->setProperty("VanGoghDriver,attached", true);
+        m_pciDevice->setProperty("VanGoghDriver,probe-only", true);
+        registerService();
+        IOLog("VanGoghDriver: probe-only start succeeded for %04x:%04x rev %02x; no BAR/GPU access attempted\n",
+              vendor, device, revision);
+        return true;
     }
 
     if (!m_pciDevice->open(this)) {
@@ -152,26 +228,38 @@ bool VanGoghDriver::start(IOService *provider) {
     m_pciDevice->setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
     m_pciDevice->setProperty("VanGoghDriver,PCI-device-id", device, 32);
     m_pciDevice->setProperty("VanGoghDriver,revision-id", revision, 8);
-    const UInt32 vramMegabytes = 4096;
-    m_pciDevice->setProperty("VRAM,totalMB", vramMegabytes, 32);
-    m_pciDevice->setProperty("VanGoghDriver,VRAM-MiB", vramMegabytes, 32);
-    IOLog("VanGoghDriver: GPU AMD Van Gogh (Steam Deck), PCI %04x:%04x, %u MiB shared VRAM\n",
-          vendor, device, vramMegabytes);
+    UInt32 vramMegabytes = 0;
+    const bool vramSizeValid =
+        readRegister32(kRccConfigMemsizeRegister, &vramMegabytes) &&
+        vramMegabytes > 0 && vramMegabytes <= VanGoghMemoryPlan::kMaxVramBytes / VanGoghMemoryPlan::kMiB;
+    if (vramSizeValid) {
+        m_pciDevice->setProperty("VRAM,totalMB", vramMegabytes, 32);
+        m_pciDevice->setProperty("VanGoghDriver,VRAM-MiB", vramMegabytes, 32);
+        IOLog("VanGoghDriver: GPU AMD Van Gogh (Steam Deck), PCI %04x:%04x, %u MiB shared VRAM (RCC readback)\n",
+              vendor, device, vramMegabytes);
+    } else {
+        IOLog("VanGoghDriver: RCC_CONFIG_MEMSIZE readback invalid; not publishing a guessed VRAM size\n");
+    }
 
     setProperty("model", "AMD Van Gogh Integrated Graphics");
     setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
     setProperty("VanGoghDriver,PCI-device-id", device, 32);
     setProperty("VanGoghDriver,revision-id", revision, 8);
-    setProperty("VanGoghDriver,VRAM-MiB", vramMegabytes, 32);
+    if (vramSizeValid) setProperty("VanGoghDriver,VRAM-MiB", vramMegabytes, 32);
     setProperty("VanGoghDriver,register-aperture-size",
                 (UInt64)m_registerLength, 64);
+    setProperty("VanGoghDriver,attached", true);
+    m_pciDevice->setProperty("VanGoghDriver,attached", true);
     loadIPDiscovery(m_pciDevice);
     inspectVanGoghVMID0();
     inspectDCN301Rotation();
     inspectDCN301Timing();
     inspectDCN301PipeRouting();
     applyConfiguredDCN301Rotation(m_pciDevice);
-    if (!allocatePanelScanout()) {
+    if (boolProperty(m_pciDevice, "VanGoghDriver,vram-scanout")) {
+        planVramScanout(m_pciDevice);
+        programVramScanout(m_pciDevice);
+    } else if (!allocatePanelScanout()) {
         IOLog("VanGoghDriver: no contiguous linear panel buffer; framebuffer remains disabled\n");
     }
     validatePSPFirmware(m_pciDevice);
@@ -181,6 +269,8 @@ bool VanGoghDriver::start(IOService *provider) {
         panelEdid->release();
     }
     registerService();
+    IOLog("VanGoghDriver: start completed; PCI identity is published, framebuffer-ready=%d\n",
+          boolProperty(m_pciDevice, "VanGoghFramebuffer,ready") ? 1 : 0);
     return true;
 }
 
@@ -479,13 +569,11 @@ void VanGoghDriver::applyConfiguredDCN301Rotation(IOService *provider) {
         requestedMask = mask->unsigned32BitValue();
         requestedAngle = angleProperty->unsigned32BitValue();
     } else {
-        // The user requested the captured Deck panel rotation. Use only the
-        // HUBPs resolved from the active panel's OTG/ODM/MPCC path; never
-        // guess from a fixed instance number.
-        requestedMask = m_panelHUBPMask;
-        requestedAngle = 3;
-        IOLog("VanGoghDriver: applying detected 270-degree panel rotation to HUBP mask %x\n",
-              requestedMask);
+        // Startup is observational by default. HUBP rotation is one field in
+        // a larger plane/modeset transaction; changing it on the live Linux-
+        // initialized or firmware-owned pipe can invalidate the active scanout.
+        IOLog("VanGoghDriver: no explicit HUBP rotation request; leaving live DCN state unchanged\n");
+        return;
     }
     if (requestedMask == 0) {
         IOLog("VanGoghDriver: no HUBP surfaces were linked to the active internal-panel OPP; skipping rotation\n");
@@ -636,6 +724,8 @@ void VanGoghDriver::inspectDCN301Rotation() {
                 case VanGoghDCN301::Register::HubpControl:
                     surfaces[hubp].hubpControl = value; surfaces[hubp].valid |= 1u << 8; break;
                 case VanGoghDCN301::Register::SurfaceConfig:
+                case VanGoghDCN301::Register::FlipControl:   // outside this loop's range
+                case VanGoghDCN301::Register::AddrConfig:
                     break;
             }
         }
@@ -749,6 +839,14 @@ void VanGoghDriver::releaseDeviceResources() {
         }
         m_rotationRestoreMask = 0;
     }
+    restoreVramScanout(false);
+    if (m_vramWindowMap != nullptr) {
+        m_vramWindowMap->release();
+        m_vramWindowMap = nullptr;
+    }
+    m_vramPatternWritten = false;
+    m_vramPlan = VanGoghMemoryPlan::Output{};
+    m_geom = VanGoghScanout::Geometry{};
     if (m_scanoutMemory != nullptr) {
         if (m_scanoutPrepared) m_scanoutMemory->complete(kIODirectionInOut);
         m_scanoutPrepared = false;
@@ -983,4 +1081,328 @@ bool VanGoghDriver::writeIPRegister32(UInt16 hwId, UInt8 instance, UInt8 segment
         return false;
     }
     return writeRegister32(byteOffset, value);
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in VRAM scanout route. None of this has run on a Steam Deck.
+//
+//   VanGoghDriver,vram-scanout          plan a surface in VRAM, map it via BAR0
+//   VanGoghDriver,vram-scanout-pattern  also fill it with a test pattern
+//   VanGoghDriver,program-vram-scanout  also point the live panel HUBPs at it
+//   VanGoghDriver,scanout-vram-offset   optional 64 KiB-aligned VRAM offset
+//
+// Properties are read from the PCI provider first (OpenCore DeviceProperties)
+// and then from this service's personality. Each stage refuses to run unless
+// the one before it succeeded, and every refusal is logged with a reason.
+// ---------------------------------------------------------------------------
+
+bool VanGoghDriver::boolProperty(IOService *provider, const char *key) const {
+    OSObject *property = provider ? provider->getProperty(key) : nullptr;
+    if (property == nullptr) property = getProperty(key);
+    if (OSBoolean *b = OSDynamicCast(OSBoolean, property)) return b == kOSBooleanTrue;
+    if (OSNumber *n = OSDynamicCast(OSNumber, property)) return n->unsigned64BitValue() != 0;
+
+    // OpenCore DeviceProperties arrive as OSData, even when the plist value
+    // was entered as a Boolean or Number. Decode short values as little-endian.
+    OSData *data = OSDynamicCast(OSData, property);
+    if (data == nullptr || data->getLength() == 0 || data->getLength() > sizeof(UInt64)) return false;
+    const UInt8 *bytes = static_cast<const UInt8 *>(data->getBytesNoCopy());
+    if (bytes == nullptr) return false;
+    UInt64 value = 0;
+    for (IOByteCount i = 0; i < data->getLength(); ++i)
+        value |= static_cast<UInt64>(bytes[i]) << (i * 8);
+    return value != 0;
+}
+
+bool VanGoghDriver::numberProperty(IOService *provider, const char *key, UInt64 *value) const {
+    if (value == nullptr) return false;
+    OSObject *property = provider ? provider->getProperty(key) : nullptr;
+    if (property == nullptr) property = getProperty(key);
+    if (OSNumber *n = OSDynamicCast(OSNumber, property)) {
+        *value = n->unsigned64BitValue();
+        return true;
+    }
+
+    OSData *data = OSDynamicCast(OSData, property);
+    if (data == nullptr || data->getLength() == 0 || data->getLength() > sizeof(UInt64)) return false;
+    const UInt8 *bytes = static_cast<const UInt8 *>(data->getBytesNoCopy());
+    if (bytes == nullptr) return false;
+    UInt64 decoded = 0;
+    for (IOByteCount i = 0; i < data->getLength(); ++i)
+        decoded |= static_cast<UInt64>(bytes[i]) << (i * 8);
+    *value = decoded;
+    return true;
+}
+
+bool VanGoghDriver::readHubpRegister(UInt8 hubp, VanGoghDCN301::Register reg, UInt32 *value) const {
+    UInt32 dword = 0;
+    return VanGoghDCN301::registerDword(hubp, reg, &dword) &&
+           readIPRegister32(VanGoghDCN301::kDisplayIPHardwareId, VanGoghDCN301::kDisplayIPInstance,
+                            VanGoghDCN301::kRegisterBaseSegment, dword, value);
+}
+
+bool VanGoghDriver::writeHubpRegister(UInt8 hubp, VanGoghDCN301::Register reg, UInt32 value) const {
+    UInt32 dword = 0;
+    return VanGoghDCN301::registerDword(hubp, reg, &dword) &&
+           writeIPRegister32(VanGoghDCN301::kDisplayIPHardwareId, VanGoghDCN301::kDisplayIPInstance,
+                             VanGoghDCN301::kRegisterBaseSegment, dword, value);
+}
+
+void VanGoghDriver::planVramScanout(IOService *provider) {
+    if (m_ipDiscovery == nullptr || m_registerMap == nullptr || m_pciDevice == nullptr) {
+        IOLog("VanGoghDriver: VRAM scanout needs IP discovery and BAR5; not planned\n");
+        return;
+    }
+    UInt32 vramMiB = 0, fbBaseReg = 0, fbTopReg = 0;
+    if (!readRegister32(kRccConfigMemsizeRegister, &vramMiB) ||
+        !readIPRegister32(kMmhubHwId, 0, kMmhubSegment, kMcVmFbLocationBase, &fbBaseReg) ||
+        !readIPRegister32(kMmhubHwId, 0, kMmhubSegment, kMcVmFbLocationTop, &fbTopReg) ||
+        vramMiB == 0 || vramMiB == UINT32_MAX || fbBaseReg == UINT32_MAX || fbTopReg == UINT32_MAX) {
+        IOLog("VanGoghDriver: VRAM size / MC FB location unreadable; VRAM scanout not planned\n");
+        return;
+    }
+    const UInt32 bar0Register = kIOPCIConfigBaseAddress0;
+    IODeviceMemory *bar0 = m_pciDevice->getDeviceMemoryWithRegister(bar0Register);
+    if (bar0 == nullptr || bar0->getLength() == 0) {
+        IOLog("VanGoghDriver: PCI BAR0 (VRAM aperture) unavailable; VRAM scanout not planned\n");
+        return;
+    }
+
+    // Pick the surface from what the panel HUBP is scanning right now. This
+    // is read-only; it also logs the raw values so a refusal is diagnosable.
+    VanGoghScanout::Geometry geom{};
+    for (UInt8 h = 0; h < VanGoghDCN301::kHUBPCount && !geom.ok; ++h) {
+        if ((m_panelHUBPMask & (1u << h)) == 0) continue;
+        UInt32 cfg = 0, vp = 0;
+        if (!readHubpRegister(h, VanGoghDCN301::Register::SurfaceConfig, &cfg) ||
+            !readHubpRegister(h, VanGoghDCN301::Register::ViewportDimension, &vp)) continue;
+        IOLog("VanGoghDriver: panel HUBP%u live surface-config %08x viewport %ux%u\n", h, cfg,
+              vp & 0x3FFFu, (vp >> 16) & 0x3FFFu);
+        geom = VanGoghScanout::chooseGeometry(cfg, vp);
+    }
+    if (!geom.ok) {
+        IOLog("VanGoghDriver: panel pipe is not scanning ARGB8888 at a supported size/rotation "
+              "(HUBP mask %x); VRAM scanout not planned\n", m_panelHUBPMask);
+        return;
+    }
+
+    VanGoghMemoryPlan::Input in;
+    in.scanoutBytes = static_cast<UInt64>(geom.pitchBytes) * geom.heightPixels;
+    in.vramBytes = static_cast<UInt64>(vramMiB) * VanGoghMemoryPlan::kMiB;
+    in.bar0Length = bar0->getLength();
+    in.fbBase = VanGoghMemoryPlan::fbBaseFromRegister(fbBaseReg);
+    in.fbTop = VanGoghMemoryPlan::fbTopFromRegister(fbTopReg);
+    UInt64 requested = 0;
+    if (numberProperty(provider, "VanGoghDriver,scanout-vram-offset", &requested))
+        in.requestedOffset = requested;
+
+    const VanGoghMemoryPlan::Output out = VanGoghMemoryPlan::plan(in);
+    if (!out.ok) {
+        IOLog("VanGoghDriver: VRAM scanout plan refused: %s (vram %u MiB, bar0 %llu MiB, fb %llx-%llx)\n",
+              VanGoghMemoryPlan::statusName(out.status), vramMiB,
+              static_cast<unsigned long long>(in.bar0Length >> 20),
+              static_cast<unsigned long long>(in.fbBase), static_cast<unsigned long long>(in.fbTop));
+        return;
+    }
+
+    IODeviceMemory *window = IODeviceMemory::withSubRange(bar0, out.vramOffset, out.bytes);
+    if (window == nullptr) {
+        IOLog("VanGoghDriver: could not describe the BAR0 scanout window\n");
+        return;
+    }
+    IOMemoryMap *map = window->map(kIOMapWriteCombineCache);
+    window->release();
+    if (map == nullptr || map->getLength() < out.bytes) {
+        if (map != nullptr) map->release();
+        IOLog("VanGoghDriver: could not map the BAR0 scanout window\n");
+        return;
+    }
+    m_vramWindowMap = map;
+    m_geom = geom;
+    m_bar0Physical = bar0->getPhysicalAddress();
+    m_vramPlan = out;
+    setProperty("VanGoghDriver,vram-scanout-offset", out.vramOffset, 64);
+    setProperty("VanGoghDriver,vram-scanout-mc-address", out.mcAddress, 64);
+    IOLog("VanGoghDriver: VRAM scanout %ux%u pitch %u (%s) planned at VRAM+0x%llx, MC 0x%llx, %llu bytes (BAR0 phys 0x%llx)\n",
+          geom.widthPixels, geom.heightPixels, geom.pitchBytes, geom.rotated ? "rotated landscape" : "native portrait",
+          static_cast<unsigned long long>(out.vramOffset), static_cast<unsigned long long>(out.mcAddress),
+          static_cast<unsigned long long>(out.bytes),
+          static_cast<unsigned long long>(m_bar0Physical + out.vramOffset));
+
+    if (boolProperty(provider, "VanGoghDriver,vram-scanout-pattern")) m_vramPatternWritten = writeVramPattern();
+}
+
+bool VanGoghDriver::writeVramPattern() {
+    if (m_vramWindowMap == nullptr || !m_vramPlan.ok) return false;
+    volatile UInt32 *px = reinterpret_cast<volatile UInt32 *>(m_vramWindowMap->getVirtualAddress());
+    if (px == nullptr) return false;
+    // Opaque ARGB: horizontal red ramp, vertical green ramp, white 8 px border,
+    // so rotation and pitch errors are obvious by eye.
+    const UInt32 w = m_geom.widthPixels, h = m_geom.heightPixels, stride = m_geom.pitchBytes / 4;
+    if (!m_geom.ok || w < 16 || h < 16) return false;
+    for (UInt32 y = 0; y < h; ++y) {
+        for (UInt32 x = 0; x < w; ++x) {
+            const bool border = x < 8 || y < 8 || x >= w - 8 || y >= h - 8;
+            const UInt32 r = (x * 255) / (w - 1);
+            const UInt32 g = (y * 255) / (h - 1);
+            px[y * stride + x] = border ? 0xFFFFFFFFu : (0xFF000000u | (r << 16) | (g << 8) | 0x40u);
+        }
+    }
+    OSSynchronizeIO();
+    setProperty("VanGoghDriver,vram-scanout-pattern-written", true);
+    IOLog("VanGoghDriver: wrote %ux%u test pattern to the VRAM scanout surface\n", w, h);
+    return true;
+}
+
+bool VanGoghDriver::applyPlane(UInt8 hubp, const VanGoghScanout::PlaneImage &img, UInt32 flipControl) {
+    using R = VanGoghDCN301::Register;
+    bool ok = writeHubpRegister(hubp, R::FlipControl, VanGoghScanout::flipControlWithLock(flipControl, true)) &&
+              writeHubpRegister(hubp, R::TilingConfig, img.tilingConfig) &&
+              writeHubpRegister(hubp, R::SurfacePitch, img.surfacePitch) &&
+              writeHubpRegister(hubp, R::SurfaceControl, img.surfaceControl) &&
+              // Linux order: high first, then low; the low write latches the pair.
+              writeHubpRegister(hubp, R::SurfaceAddressHigh, img.addressHigh) &&
+              writeHubpRegister(hubp, R::SurfaceAddressLow, img.addressLow);
+    OSSynchronizeIO();
+    // Always release the update lock, even after a failed write.
+    ok = writeHubpRegister(hubp, R::FlipControl, VanGoghScanout::flipControlWithLock(flipControl, false)) && ok;
+    if (!ok) return false;
+
+    // Wait for the flip to latch (SURFACE_FLIP_PENDING, bit 8), up to ~100 ms.
+    // Do not publish a framebuffer if the display engine never acknowledged it.
+    UInt32 flip = 0;
+    bool flipLatched = false;
+    for (int i = 0; i < 100; ++i) {
+        if (readHubpRegister(hubp, R::FlipControl, &flip) && (flip & 0x100u) == 0) {
+            flipLatched = true;
+            break;
+        }
+        IOSleep(1);
+    }
+    if (!flipLatched) {
+        IOLog("VanGoghDriver: HUBP%u surface flip did not latch within 100 ms\n", hubp);
+        return false;
+    }
+    UInt32 tiling = 0, pitch = 0, control = 0, hi = 0, lo = 0;
+    return readHubpRegister(hubp, R::TilingConfig, &tiling) && tiling == img.tilingConfig &&
+           readHubpRegister(hubp, R::SurfacePitch, &pitch) && (pitch & 0x3FFFu) == (img.surfacePitch & 0x3FFFu) &&
+           readHubpRegister(hubp, R::SurfaceControl, &control) && control == img.surfaceControl &&
+           readHubpRegister(hubp, R::SurfaceAddressHigh, &hi) && hi == img.addressHigh &&
+           readHubpRegister(hubp, R::SurfaceAddressLow, &lo) && lo == img.addressLow;
+}
+
+void VanGoghDriver::programVramScanout(IOService *provider) {
+    if (!boolProperty(provider, "VanGoghDriver,program-vram-scanout")) {
+        IOLog("VanGoghDriver: program-vram-scanout not requested; live DCN state unchanged\n");
+        return;
+    }
+    if (!m_vramPlan.ok || !m_vramPatternWritten) {
+        IOLog("VanGoghDriver: refusing to program HUBP: needs a planned VRAM surface with the test pattern written\n");
+        return;
+    }
+    if (m_panelHUBPMask == 0) {
+        IOLog("VanGoghDriver: refusing to program HUBP: no HUBP linked to the active internal panel\n");
+        return;
+    }
+
+    using R = VanGoghDCN301::Register;
+    VanGoghScanout::Request request{};
+    request.gpuAddress = m_vramPlan.mcAddress;
+    request.widthPixels = m_geom.widthPixels;
+    request.heightPixels = m_geom.heightPixels;
+    request.pitchBytes = m_geom.pitchBytes;
+
+    // Phase 1: read and validate every target before writing any of them.
+    UInt32 pending = 0;
+    for (UInt8 h = 0; h < VanGoghDCN301::kHUBPCount; ++h) {
+        if ((m_panelHUBPMask & (1u << h)) == 0) continue;
+        ScanoutRestore &r = m_scanoutRestore[h];
+        VanGoghScanout::Baseline &b = r.original;
+        if (!readHubpRegister(h, R::SurfaceConfig, &b.surfaceConfig) ||
+            !readHubpRegister(h, R::TilingConfig, &b.tilingConfig) ||
+            !readHubpRegister(h, R::ViewportDimension, &b.viewportDimension) ||
+            !readHubpRegister(h, R::SurfacePitch, &b.surfacePitch) ||
+            !readHubpRegister(h, R::SurfaceControl, &b.surfaceControl) ||
+            !readHubpRegister(h, R::FlipControl, &b.flipControl) ||
+            !readHubpRegister(h, R::HubpControl, &b.hubpControl) ||
+            !readHubpRegister(h, R::SurfaceAddressLow, &r.originalAddressLow) ||
+            !readHubpRegister(h, R::SurfaceAddressHigh, &r.originalAddressHigh)) {
+            IOLog("VanGoghDriver: HUBP%u baseline read failed; nothing programmed\n", h);
+            return;
+        }
+        const VanGoghScanout::Status st = VanGoghScanout::buildLinearPlane(b, request, &r.programmed);
+        if (st != VanGoghScanout::Status::Ok) {
+            IOLog("VanGoghDriver: HUBP%u refused: %s (config %08x viewport %08x pitch %08x)\n", h,
+                  VanGoghScanout::statusName(st), b.surfaceConfig, b.viewportDimension, b.surfacePitch);
+            return;
+        }
+        // Every target must be in the same mode the surface was sized for.
+        const VanGoghScanout::Geometry hg = VanGoghScanout::chooseGeometry(b.surfaceConfig, b.viewportDimension);
+        if (!hg.ok || hg.rotated != m_geom.rotated) {
+            IOLog("VanGoghDriver: HUBP%u is in a different mode than the planned surface; nothing programmed\n", h);
+            return;
+        }
+        pending |= 1u << h;
+    }
+    if (pending != m_panelHUBPMask) return;
+
+    // Phase 2: write, verify, and roll everything back on the first failure.
+    for (UInt8 h = 0; h < VanGoghDCN301::kHUBPCount; ++h) {
+        if ((pending & (1u << h)) == 0) continue;
+        m_scanoutRestoreMask |= 1u << h;            // from here on, restore covers this HUBP
+        if (!applyPlane(h, m_scanoutRestore[h].programmed, m_scanoutRestore[h].original.flipControl)) {
+            IOLog("VanGoghDriver: HUBP%u plane write failed verification; rolling back\n", h);
+            restoreVramScanout(true);
+            return;
+        }
+    }
+
+    IOSleep(50);
+    for (UInt8 h = 0; h < VanGoghDCN301::kHUBPCount; ++h) {
+        UInt32 ctl = 0;
+        if ((pending & (1u << h)) && readHubpRegister(h, R::HubpControl, &ctl) &&
+            VanGoghScanout::underflowStatus(ctl) != 0)
+            IOLog("VanGoghDriver: HUBP%u reports underflow status %u after reprogramming\n", h,
+                  VanGoghScanout::underflowStatus(ctl));
+    }
+
+    setProperty("VanGoghFramebuffer,scanout-physical",
+                static_cast<UInt64>(m_bar0Physical + m_vramPlan.vramOffset), 64);
+    setProperty("VanGoghFramebuffer,scanout-bytes",
+                static_cast<UInt64>(m_geom.pitchBytes) * m_geom.heightPixels, 64);
+    setProperty("VanGoghFramebuffer,width", m_geom.widthPixels, 32);
+    setProperty("VanGoghFramebuffer,height", m_geom.heightPixels, 32);
+    setProperty("VanGoghFramebuffer,pitch", m_geom.pitchBytes, 32);
+    setProperty("VanGoghFramebuffer,refresh", 60, 32);
+    setProperty("VanGoghFramebuffer,linear-scanout", true);
+    setProperty("VanGoghFramebuffer,gpu-address-mapped", true);
+    setProperty("VanGoghFramebuffer,surface-programmed", true);
+    setProperty("VanGoghFramebuffer,rotation-programmed", m_geom.rotated);
+    setProperty("VanGoghDriver,gpuvm-scanout-ready", true);
+    IOLog("VanGoghDriver: programmed HUBP mask %x to scan out VRAM MC 0x%llx (%ux%u, %s)\n", pending,
+          static_cast<unsigned long long>(m_vramPlan.mcAddress), m_geom.widthPixels, m_geom.heightPixels,
+          m_geom.rotated ? "rotated 270" : "native portrait");
+    // Publishing 'ready' last is what lets the VanGoghFramebuffer personality match.
+    setProperty("VanGoghFramebuffer,ready", true);
+}
+
+void VanGoghDriver::restoreVramScanout(bool force) {
+    using R = VanGoghDCN301::Register;
+    for (UInt8 h = 0; h < VanGoghDCN301::kHUBPCount; ++h) {
+        if ((m_scanoutRestoreMask & (1u << h)) == 0) continue;
+        const ScanoutRestore &r = m_scanoutRestore[h];
+        UInt32 hi = 0, lo = 0;
+        const bool stillOurs = readHubpRegister(h, R::SurfaceAddressHigh, &hi) && hi == r.programmed.addressHigh &&
+                               readHubpRegister(h, R::SurfaceAddressLow, &lo) && lo == r.programmed.addressLow;
+        if (!force && !stillOurs) continue;     // someone else reprogrammed it; leave it alone
+        writeHubpRegister(h, R::FlipControl, VanGoghScanout::flipControlWithLock(r.original.flipControl, true));
+        writeHubpRegister(h, R::TilingConfig, r.original.tilingConfig);
+        writeHubpRegister(h, R::SurfacePitch, r.original.surfacePitch);
+        writeHubpRegister(h, R::SurfaceControl, r.original.surfaceControl);
+        writeHubpRegister(h, R::SurfaceAddressHigh, r.originalAddressHigh);
+        writeHubpRegister(h, R::SurfaceAddressLow, r.originalAddressLow);
+        OSSynchronizeIO();
+        writeHubpRegister(h, R::FlipControl, VanGoghScanout::flipControlWithLock(r.original.flipControl, false));
+    }
+    m_scanoutRestoreMask = 0;
 }
