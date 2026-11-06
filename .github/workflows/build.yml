@@ -17,6 +17,8 @@ jobs:
 
       - name: Build unsigned x86_64 Van Gogh driver kext
         run: xcodebuild -project SteamDeckintosh.xcodeproj -target SteamDeckintosh -configuration Debug -sdk macosx -arch x86_64 SYMROOT=build CODE_SIGNING_ALLOWED=NO build
+      - name: Strip debug symbols
+        run: strip -S build/Debug/SteamDeckintosh.kext/Contents/MacOS/SteamDeckintosh
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
