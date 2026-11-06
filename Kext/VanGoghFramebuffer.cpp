@@ -43,10 +43,14 @@ private:
     bool m_scanoutReady{false};
     IOPhysicalAddress m_scanoutPhysical{0};
     IOPhysicalLength m_scanoutBytes{0};
+    IOPhysicalAddress m_vramPhysical{0};
+    IOPhysicalLength m_vramBytes{0};
     UInt32 m_width{0};
     UInt32 m_height{0};
     UInt32 m_pitch{0};
     UInt32 m_refresh{0};
+    UInt32 m_displayWidth{0};
+    UInt32 m_displayHeight{0};
     bool m_rotationSupported{false};
     OSData *m_edid{nullptr};
 };
@@ -80,6 +84,16 @@ bool VanGoghFramebuffer::start(IOService *provider) {
         ? OSDynamicCast(OSBoolean, provider->getProperty("VanGoghFramebuffer,surface-programmed"))
         : nullptr;
     const bool rotationProgrammed = (rotation == kOSBooleanTrue);
+    UInt64 displayWidth = 0, displayHeight = 0, vramPhysical = 0, vramBytes = 0;
+    const bool haveDisplaySize =
+        readNumber(provider, "VanGoghFramebuffer,display-width", &displayWidth) &&
+        readNumber(provider, "VanGoghFramebuffer,display-height", &displayHeight) &&
+        displayWidth != 0 && displayHeight != 0 &&
+        displayWidth <= 8192 && displayHeight <= 8192;
+    const bool haveVramRange =
+        readNumber(provider, "VanGoghFramebuffer,vram-physical", &vramPhysical) &&
+        readNumber(provider, "VanGoghFramebuffer,vram-bytes", &vramBytes) &&
+        vramPhysical != 0 && vramBytes != 0 && vramPhysical <= UINT64_MAX - vramBytes;
     if (ready != kOSBooleanTrue || linearScanout != kOSBooleanTrue ||
         gpuAddressMapped != kOSBooleanTrue || surfaceProgrammed != kOSBooleanTrue ||
         !readNumber(provider, "VanGoghFramebuffer,scanout-physical", &physical) ||
@@ -95,29 +109,44 @@ bool VanGoghFramebuffer::start(IOService *provider) {
     // Cap dimensions and validate all arithmetic before exposing memory to
     // IOGraphics. The parent owns scanout allocation and DCN configuration.
     if (physical == 0 || bytes == 0 || width == 0 || width > 8192 ||
-        height == 0 || height > 8192 || pitch > UINT32_MAX ||
+        height == 0 || height > 8192 || pitch == 0 || pitch > 32768 ||
         pitch < width * 4 || refresh == 0 || refresh > 240 ||
         height > UINT64_MAX / pitch || bytes < pitch * height ||
         physical > UINT64_MAX - bytes) {
         IOLog("VanGoghFramebuffer: refusing invalid scanout geometry or range\n");
         return false;
     }
-    // Two scanout shapes: a 1280x800 source the HUBP rotates 270 degrees to the
-    // portrait panel, or a native 800x1280 surface with no rotation.
-    const bool landscapeRotated = (width == 1280 && height == 800 && rotationProgrammed);
-    const bool nativePortrait = (width == 800 && height == 1280 && !rotationProgrammed);
-    if ((!landscapeRotated && !nativePortrait) || refresh != 60) {
-        IOLog("VanGoghFramebuffer: unsupported scanout %llux%llu@%llu (rotation %d)\n",
-              width, height, refresh, rotationProgrammed ? 1 : 0);
+
+    // The parent reports the physical panel dimensions separately from the
+    // source buffer. If it does not, derive them from the programmed rotation.
+    if (!haveDisplaySize) {
+        displayWidth = rotationProgrammed ? height : width;
+        displayHeight = rotationProgrammed ? width : height;
+    }
+    if (!haveVramRange) {
+        vramPhysical = physical;
+        vramBytes = bytes;
+    }
+    if (vramBytes < bytes) vramBytes = bytes;
+
+    // Until the live OTG timing is decoded, only the captured 800x1280@60 eDP
+    // panel has a timing/EDID pair that we can describe exactly.
+    if (displayWidth != 800 || displayHeight != 1280 || refresh != 60) {
+        IOLog("VanGoghFramebuffer: no timing for %llux%llu@%llu (rotation %d); only the 800x1280 eDP panel is supported\n",
+              displayWidth, displayHeight, refresh, rotationProgrammed ? 1 : 0);
         return false;
     }
 
     m_scanoutPhysical = static_cast<IOPhysicalAddress>(physical);
     m_scanoutBytes = static_cast<IOPhysicalLength>(bytes);
+    m_vramPhysical = static_cast<IOPhysicalAddress>(vramPhysical);
+    m_vramBytes = static_cast<IOPhysicalLength>(vramBytes);
     m_width = static_cast<UInt32>(width);
     m_height = static_cast<UInt32>(height);
     m_pitch = static_cast<UInt32>(pitch);
     m_refresh = static_cast<UInt32>(refresh);
+    m_displayWidth = static_cast<UInt32>(displayWidth);
+    m_displayHeight = static_cast<UInt32>(displayHeight);
     m_scanoutReady = true;
 
     // The live Deck state shows AR24, 1280x800, 5120-byte pitch rotated to
@@ -157,7 +186,10 @@ bool VanGoghFramebuffer::start(IOService *provider) {
         }
         return false;
     }
-    setProperty("IOFBMemorySize", static_cast<UInt64>(m_scanoutBytes), 64);
+    setProperty("IOFBMemorySize", static_cast<UInt64>(m_vramBytes), 64);
+    setProperty("VRAM,totalMB", static_cast<UInt32>(m_vramBytes >> 20), 32);
+    setProperty("model", "AMD Van Gogh (Steam Deck)");
+    setProperty("IOFBCurrentPixelClock", 69270000, 32);
     if (m_edid != nullptr) {
         setProperty("IODisplayEDID", m_edid);
         setProperty("EDID", m_edid);
@@ -200,7 +232,10 @@ IODeviceMemory *VanGoghFramebuffer::getApertureRange(IOPixelAperture aperture) {
 }
 
 IODeviceMemory *VanGoghFramebuffer::getVRAMRange() {
-    return getApertureRange(kIOFBSystemAperture);
+    if (!m_scanoutReady || m_vramPhysical == 0 || m_vramBytes == 0) return nullptr;
+    IODeviceMemory *range = IODeviceMemory::withRange(m_vramPhysical, m_vramBytes);
+    if (range != nullptr) range->setTag(kIOMapWriteCombineCache);
+    return range;
 }
 
 const char *VanGoghFramebuffer::getPixelFormats() { return IO32BitDirectPixels; }
@@ -218,8 +253,8 @@ IOReturn VanGoghFramebuffer::getInformationForDisplayMode(
     bzero(info, sizeof(*info));
     // Mode dimensions describe the physical panel timing. Pixel information
     // below describes the landscape source buffer when the DCN plane rotates.
-    info->nominalWidth = m_rotationSupported ? 800 : m_width;
-    info->nominalHeight = m_rotationSupported ? 1280 : m_height;
+    info->nominalWidth = m_displayWidth;
+    info->nominalHeight = m_displayHeight;
     info->refreshRate = m_refresh << 16;
     info->maxDepthIndex = 0;
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag |
@@ -247,11 +282,11 @@ IOReturn VanGoghFramebuffer::getTimingInfoForDisplayMode(
     }
     timing->signalConfig = kIODigitalSignal;
     timing->pixelClock = 69270000;
-    timing->horizontalActive = 800;
+    timing->horizontalActive = m_displayWidth;
     timing->horizontalBlanking = 72;
     timing->horizontalSyncOffset = 32;
     timing->horizontalSyncPulseWidth = 20;
-    timing->verticalActive = 1280;
+    timing->verticalActive = m_displayHeight;
     timing->verticalBlanking = 44;
     timing->verticalSyncOffset = 16;
     timing->verticalSyncPulseWidth = 2;

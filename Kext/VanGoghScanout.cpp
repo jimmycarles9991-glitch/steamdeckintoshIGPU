@@ -37,6 +37,64 @@ Status buildLinearPlane(const Baseline &b, const Request &r, PlaneImage *out) {
     return Status::Ok;
 }
 
+LiveStatus describeLiveSurface(uint32_t surfaceConfig, uint32_t tilingConfig,
+                               uint32_t viewportDimension, uint32_t surfacePitch,
+                               uint32_t surfaceControl, uint32_t addressLow,
+                               uint32_t addressHigh, LiveSurface *out) {
+    if (out == nullptr) return LiveStatus::Unreadable;
+    if (surfaceConfig == UINT32_MAX || tilingConfig == UINT32_MAX ||
+        viewportDimension == UINT32_MAX || surfacePitch == UINT32_MAX ||
+        surfaceControl == UINT32_MAX || addressLow == UINT32_MAX ||
+        addressHigh == UINT32_MAX)
+        return LiveStatus::Unreadable;
+
+    if ((surfaceConfig & kPixelFormatMask) != kPixelFormatARGB8888)
+        return LiveStatus::FormatNotARGB8888;
+    // DCC and any non-linear swizzle make the memory layout opaque to a plain
+    // CPU mapping. Firmware GOP surfaces are linear; Linux-composited ones are not.
+    if ((tilingConfig & kSwModeMask) != 0 || (surfaceControl & 0x2u) != 0)
+        return LiveStatus::NotLinearUncompressed;
+
+    const uint32_t w = viewportDimension & kPitchMask;
+    const uint32_t h = (viewportDimension >> 16) & kPitchMask;
+    if (w == 0 || h == 0 || w > kMaxFramebufferDimension || h > kMaxFramebufferDimension)
+        return LiveStatus::ViewportInvalid;
+
+    const uint64_t pitchBytes = static_cast<uint64_t>(surfacePitch & kPitchMask) + 1ull;
+    const uint64_t pitchByteCount = pitchBytes * 4ull;
+    if (pitchByteCount < static_cast<uint64_t>(w) * 4ull ||
+        pitchByteCount > kMaxFramebufferPitchBytes)
+        return LiveStatus::PitchInvalid;
+
+    const uint64_t address = (static_cast<uint64_t>(addressHigh) << 32) | addressLow;
+    if (address == 0 || (address & 0xFFull) != 0 || address >= kMaxGpuAddress)
+        return LiveStatus::AddressInvalid;
+
+    out->widthPixels = w;
+    out->heightPixels = h;
+    out->pitchBytes = static_cast<uint32_t>(pitchByteCount);
+    out->rotation = (surfaceConfig >> 8) & 3u;
+    out->gpuAddress = address;
+    return LiveStatus::Ok;
+}
+
+bool isRotated270(const LiveSurface &surface) {
+    return surface.rotation == 3;
+}
+
+const char *liveStatusName(LiveStatus status) {
+    switch (status) {
+        case LiveStatus::Ok: return "ok";
+        case LiveStatus::Unreadable: return "HUBP surface registers unreadable";
+        case LiveStatus::FormatNotARGB8888: return "live surface is not ARGB8888";
+        case LiveStatus::NotLinearUncompressed: return "live surface is tiled or DCC-compressed";
+        case LiveStatus::ViewportInvalid: return "live viewport is empty or too large";
+        case LiveStatus::PitchInvalid: return "live pitch is invalid";
+        case LiveStatus::AddressInvalid: return "live surface address is invalid";
+    }
+    return "unknown";
+}
+
 Geometry chooseGeometry(uint32_t surfaceConfig, uint32_t viewportDimension) {
     Geometry g{};
     if (surfaceConfig == UINT32_MAX || viewportDimension == UINT32_MAX) return g;

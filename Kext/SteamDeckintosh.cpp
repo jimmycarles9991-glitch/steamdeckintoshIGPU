@@ -39,6 +39,10 @@ constexpr UInt32 kPanelSourceHeight = 800;
 constexpr UInt32 kPanelSourcePitch = kPanelSourceWidth * 4;
 constexpr IOByteCount kPanelSourceBytes =
     static_cast<IOByteCount>(kPanelSourcePitch) * kPanelSourceHeight;
+// macOS's unaccelerated WindowServer comfortably covers one 1280x800 panel from
+// a 128 MiB aperture. The GPU really reports 4 GiB of shared system memory; this
+// is the amount advertised to IOGraphics, not a hardware partition.
+constexpr UInt32 kDefaultVramExposureMiB = 128;
 }
 
 class VanGoghDriver : public IOService {
@@ -56,6 +60,13 @@ private:
     void inspectDCN301PipeRouting();
     void inspectVanGoghVMID0();
     bool allocatePanelScanout();
+    void publishVramCapacity(IOService *provider, UInt32 reportedMiB);
+    bool readMemoryWindow(UInt32 *vramMiB, UInt64 *fbBase, UInt64 *fbTop,
+                          IODeviceMemory **bar0);
+    VanGoghScanout::LiveStatus readLiveSurface(UInt8 hubp,
+                                               VanGoghScanout::LiveSurface *surface);
+    bool adoptLiveScanout(IOService *provider);
+    bool framebufferReady() const;
     // Opt-in VRAM scanout route (see README). Each stage needs its own
     // provider/personality property and nothing below runs by default.
     bool boolProperty(IOService *provider, const char *key) const;
@@ -111,6 +122,10 @@ private:
     bool m_vramPatternWritten{false};
     UInt32 m_scanoutRestoreMask{0};
     ScanoutRestore m_scanoutRestore[VanGoghDCN301::kHUBPCount]{};
+    bool m_liveScanoutAdopted{false};
+    UInt64 m_liveVramOffset{0};
+    UInt64 m_liveApertureBytes{0};
+    UInt64 m_exposedVramBytes{0};
 };
 
 OSDefineMetaClassAndStructors(VanGoghDriver, IOService)
@@ -232,13 +247,13 @@ bool VanGoghDriver::start(IOService *provider) {
     const bool vramSizeValid =
         readRegister32(kRccConfigMemsizeRegister, &vramMegabytes) &&
         vramMegabytes > 0 && vramMegabytes <= VanGoghMemoryPlan::kMaxVramBytes / VanGoghMemoryPlan::kMiB;
+    publishVramCapacity(m_pciDevice, vramSizeValid ? vramMegabytes : 0);
     if (vramSizeValid) {
-        m_pciDevice->setProperty("VRAM,totalMB", vramMegabytes, 32);
-        m_pciDevice->setProperty("VanGoghDriver,VRAM-MiB", vramMegabytes, 32);
-        IOLog("VanGoghDriver: GPU AMD Van Gogh (Steam Deck), PCI %04x:%04x, %u MiB shared VRAM (RCC readback)\n",
-              vendor, device, vramMegabytes);
+        IOLog("VanGoghDriver: GPU AMD Van Gogh (Steam Deck), PCI %04x:%04x, %u MiB shared VRAM reported, %llu MiB exposed to IOGraphics\n",
+              vendor, device, vramMegabytes,
+              static_cast<unsigned long long>(m_exposedVramBytes >> 20));
     } else {
-        IOLog("VanGoghDriver: RCC_CONFIG_MEMSIZE readback invalid; not publishing a guessed VRAM size\n");
+        IOLog("VanGoghDriver: RCC_CONFIG_MEMSIZE readback invalid; advertising only the requested IOGraphics aperture\n");
     }
 
     setProperty("model", "AMD Van Gogh Integrated Graphics");
@@ -259,8 +274,16 @@ bool VanGoghDriver::start(IOService *provider) {
     if (boolProperty(m_pciDevice, "VanGoghDriver,vram-scanout")) {
         planVramScanout(m_pciDevice);
         programVramScanout(m_pciDevice);
-    } else if (!allocatePanelScanout()) {
-        IOLog("VanGoghDriver: no contiguous linear panel buffer; framebuffer remains disabled\n");
+    }
+    // The default route: the display engine is already scanning a linear
+    // firmware/OpenCore surface. Expose exactly that memory to IOGraphics so
+    // WindowServer has a working, unaccelerated framebuffer without any DCN write.
+    if (!framebufferReady()) {
+        if (!adoptLiveScanout(m_pciDevice) &&
+            !boolProperty(m_pciDevice, "VanGoghDriver,vram-scanout") &&
+            !allocatePanelScanout()) {
+            IOLog("VanGoghDriver: no usable live scanout and no contiguous linear panel buffer; framebuffer remains disabled\n");
+        }
     }
     validatePSPFirmware(m_pciDevice);
     OSData *panelEdid = OSData::withBytes(kSteamDeckPanelEDID, sizeof(kSteamDeckPanelEDID));
@@ -270,7 +293,7 @@ bool VanGoghDriver::start(IOService *provider) {
     }
     registerService();
     IOLog("VanGoghDriver: start completed; PCI identity is published, framebuffer-ready=%d\n",
-          boolProperty(m_pciDevice, "VanGoghFramebuffer,ready") ? 1 : 0);
+          framebufferReady() ? 1 : 0);
     return true;
 }
 
@@ -457,6 +480,252 @@ bool VanGoghDriver::allocatePanelScanout() {
           static_cast<unsigned long long>(physical),
           static_cast<unsigned long long>(kPanelSourceBytes));
     return true;
+}
+
+// Publish the VRAM amount that IOGraphics should believe it has. The hardware
+// reports 4 GiB of shared LPDDR5; a 128 MiB window is enough for one panel and
+// keeps the unaccelerated framebuffer away from firmware/TMR allocations.
+void VanGoghDriver::publishVramCapacity(IOService *provider, UInt32 reportedMiB) {
+    UInt64 requestedMiB = kDefaultVramExposureMiB;
+    UInt64 configured = 0;
+    if (numberProperty(provider, "VanGoghDriver,vram-mb", &configured) &&
+        configured >= 16 && configured <= VanGoghMemoryPlan::kMaxVramBytes / VanGoghMemoryPlan::kMiB) {
+        requestedMiB = configured;
+    }
+    if (reportedMiB != 0 && requestedMiB > reportedMiB) requestedMiB = reportedMiB;
+    if (requestedMiB == 0) requestedMiB = kDefaultVramExposureMiB;
+
+    m_exposedVramBytes = requestedMiB * VanGoghMemoryPlan::kMiB;
+    const UInt32 exposedMiB = static_cast<UInt32>(requestedMiB);
+    if (m_pciDevice != nullptr) {
+        m_pciDevice->setProperty("VRAM,totalMB", exposedMiB, 32);
+        if (reportedMiB != 0)
+            m_pciDevice->setProperty("VanGoghDriver,VRAM-reported-MiB", reportedMiB, 32);
+    }
+    setProperty("VRAM,totalMB", exposedMiB, 32);
+    setProperty("VanGoghDriver,VRAM-exposed-MiB", exposedMiB, 32);
+    setProperty("VanGoghDriver,vram-exposure-source",
+                reportedMiB != 0 ? "RCC readback + requested cap" : "requested only");
+}
+
+bool VanGoghDriver::readMemoryWindow(UInt32 *vramMiB, UInt64 *fbBase, UInt64 *fbTop,
+                                     IODeviceMemory **bar0) {
+    if (vramMiB == nullptr || fbBase == nullptr || fbTop == nullptr || bar0 == nullptr ||
+        m_pciDevice == nullptr || m_ipDiscovery == nullptr || m_registerMap == nullptr)
+        return false;
+    UInt32 memsize = 0, baseReg = 0, topReg = 0;
+    if (!readRegister32(kRccConfigMemsizeRegister, &memsize) ||
+        !readIPRegister32(kMmhubHwId, 0, kMmhubSegment, kMcVmFbLocationBase, &baseReg) ||
+        !readIPRegister32(kMmhubHwId, 0, kMmhubSegment, kMcVmFbLocationTop, &topReg))
+        return false;
+    if (memsize == 0 || memsize == UINT32_MAX ||
+        baseReg == UINT32_MAX || topReg == UINT32_MAX)
+        return false;
+    IODeviceMemory *memory =
+        m_pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+    if (memory == nullptr || memory->getLength() < PAGE_SIZE) return false;
+    *vramMiB = memsize;
+    *fbBase = VanGoghMemoryPlan::fbBaseFromRegister(baseReg);
+    *fbTop = VanGoghMemoryPlan::fbTopFromRegister(topReg);
+    *bar0 = memory;
+    return true;
+}
+
+VanGoghScanout::LiveStatus VanGoghDriver::readLiveSurface(
+    UInt8 hubp, VanGoghScanout::LiveSurface *surface) {
+    using R = VanGoghDCN301::Register;
+    UInt32 cfg = 0, tiling = 0, viewport = 0, pitch = 0, control = 0, low = 0, high = 0;
+    if (!readHubpRegister(hubp, R::SurfaceConfig, &cfg) ||
+        !readHubpRegister(hubp, R::TilingConfig, &tiling) ||
+        !readHubpRegister(hubp, R::ViewportDimension, &viewport) ||
+        !readHubpRegister(hubp, R::SurfacePitch, &pitch) ||
+        !readHubpRegister(hubp, R::SurfaceControl, &control) ||
+        !readHubpRegister(hubp, R::SurfaceAddressLow, &low) ||
+        !readHubpRegister(hubp, R::SurfaceAddressHigh, &high)) {
+        return VanGoghScanout::LiveStatus::Unreadable;
+    }
+    return VanGoghScanout::describeLiveSurface(cfg, tiling, viewport, pitch, control,
+                                               low, high, surface);
+}
+
+bool VanGoghDriver::framebufferReady() const {
+    OSBoolean *ready = OSDynamicCast(OSBoolean, getProperty("VanGoghFramebuffer,ready"));
+    return ready == kOSBooleanTrue;
+}
+
+// Adopt the surface the boot firmware/OpenCore left scanning on the internal
+// panel. This is deliberately read-only: it validates that the plane is linear,
+// uncompressed ARGB8888, translates its MC address into the CPU-visible BAR0
+// window, and publishes that window as the framebuffer aperture. macOS then
+// draws directly into the memory the display engine is already reading.
+bool VanGoghDriver::adoptLiveScanout(IOService *provider) {
+    if (m_liveScanoutAdopted) return true;
+    if (provider != nullptr &&
+        provider->getProperty("VanGoghDriver,adopt-live-scanout") != nullptr &&
+        !boolProperty(provider, "VanGoghDriver,adopt-live-scanout")) {
+        IOLog("VanGoghDriver: live scanout adoption disabled by property\n");
+        return false;
+    }
+    if (m_pciDevice == nullptr || m_ipDiscovery == nullptr || m_registerMap == nullptr) {
+        IOLog("VanGoghDriver: live scanout adoption needs IP discovery and BAR5 mapping\n");
+        return false;
+    }
+
+    UInt32 vramMiB = 0;
+    UInt64 fbBase = 0, fbTop = 0;
+    IODeviceMemory *bar0 = nullptr;
+    if (!readMemoryWindow(&vramMiB, &fbBase, &fbTop, &bar0)) {
+        IOLog("VanGoghDriver: cannot read VRAM size / MC FB window; not adopting live scanout\n");
+        return false;
+    }
+    const UInt64 vramBytes = static_cast<UInt64>(vramMiB) * VanGoghMemoryPlan::kMiB;
+    if (fbTop < fbBase || fbTop - fbBase + 1 < vramBytes) {
+        IOLog("VanGoghDriver: MC FB window %llx-%llx does not cover %u MiB; not adopting live scanout\n",
+              static_cast<unsigned long long>(fbBase), static_cast<unsigned long long>(fbTop), vramMiB);
+        return false;
+    }
+
+    // A HUBP address is only an MC address while VMID0 translation is off
+    // (firmware/OpenCore). Resolving an active page table is GMC bring-up work.
+    // If the context register cannot be read we also refuse: guessing could
+    // expose a GPU virtual address as if it were memory the CPU can draw into.
+    UInt32 vmid0Control = 0;
+    if (!readIPRegister32(kMmhubHwId, 0, kMmhubSegment, 0x0740, &vmid0Control)) {
+        IOLog("VanGoghDriver: cannot read MMHUB VMID0 context control; refusing to adopt the live HUBP address as MC\n");
+        return false;
+    }
+    if ((vmid0Control & 1u) != 0) {
+        IOLog("VanGoghDriver: MMHUB VMID0 translation is enabled (control %08x); refusing to treat the live HUBP address as MC\n",
+              vmid0Control);
+        return false;
+    }
+
+    // Prefer the HUBP linked to the internal panel. If the topology readback was
+    // inconclusive, or the panel pipe does not expose a full-panel surface, fall
+    // back to every HUBP so an unusual firmware routing still gets a chance.
+    UInt32 passes[2] = {m_panelHUBPMask, (1u << VanGoghDCN301::kHUBPCount) - 1u};
+    const unsigned passCount =
+        (m_panelHUBPMask != 0 && passes[1] != passes[0]) ? 2u : 1u;
+    if (m_panelHUBPMask == 0) passes[0] = passes[1];
+
+    for (unsigned pass = 0; pass < passCount; ++pass) {
+        const UInt32 candidates = passes[pass];
+        const bool knownPanel = pass == 0 && m_panelHUBPMask != 0;
+        for (UInt8 hubp = 0; hubp < VanGoghDCN301::kHUBPCount; ++hubp) {
+            if ((candidates & (1u << hubp)) == 0) continue;
+            VanGoghScanout::LiveSurface surface{};
+            const VanGoghScanout::LiveStatus status = readLiveSurface(hubp, &surface);
+            if (status != VanGoghScanout::LiveStatus::Ok) {
+                IOLog("VanGoghDriver: HUBP%u live surface not adoptable: %s\n",
+                      hubp, VanGoghScanout::liveStatusName(status));
+                continue;
+            }
+
+            const UInt64 surfaceBytes =
+                static_cast<UInt64>(surface.pitchBytes) * surface.heightPixels;
+            const VanGoghMemoryPlan::Translation translation =
+                VanGoghMemoryPlan::translateMcAddress(surface.gpuAddress, surfaceBytes,
+                                                      fbBase, vramBytes, bar0->getLength());
+            if (!translation.ok) {
+                IOLog("VanGoghDriver: HUBP%u MC 0x%llx %ux%u pitch %u: %s\n", hubp,
+                      static_cast<unsigned long long>(surface.gpuAddress),
+                      surface.widthPixels, surface.heightPixels, surface.pitchBytes,
+                      VanGoghMemoryPlan::translationStatusName(translation.status));
+                continue;
+            }
+
+            const UInt64 apertureBytes =
+                (surfaceBytes + PAGE_SIZE - 1) & ~static_cast<UInt64>(PAGE_SIZE - 1);
+            if (apertureBytes > translation.maxBytes) {
+                IOLog("VanGoghDriver: HUBP%u surface needs %llu bytes but only %llu remain in BAR0\n",
+                      hubp, static_cast<unsigned long long>(apertureBytes),
+                      static_cast<unsigned long long>(translation.maxBytes));
+                continue;
+            }
+
+            const bool rotated = VanGoghScanout::isRotated270(surface);
+            const UInt32 displayWidth = rotated ? surface.heightPixels : surface.widthPixels;
+            const UInt32 displayHeight = rotated ? surface.widthPixels : surface.heightPixels;
+            // Only the captured 800x1280@60 eDP panel has a timing and EDID here.
+            // Skip any other live pipe (for example an external monitor) instead of
+            // exposing a framebuffer with the wrong timing.
+            if (displayWidth != 800 || displayHeight != 1280) {
+                IOLog("VanGoghDriver: HUBP%u live mode %ux%u is not the 800x1280 panel; not adopting it\n",
+                      hubp, displayWidth, displayHeight);
+                continue;
+            }
+
+            UInt64 exposure = m_exposedVramBytes != 0 ? m_exposedVramBytes
+                                                      : static_cast<UInt64>(kDefaultVramExposureMiB) *
+                                                            VanGoghMemoryPlan::kMiB;
+            if (exposure > vramBytes) exposure = vramBytes;
+            if (exposure > bar0->getLength()) exposure = bar0->getLength();
+            // The reported VRAM window starts at BAR0 offset 0, so it must also
+            // cover a live surface that happens to sit high in the aperture.
+            const UInt64 needed = translation.vramOffset + apertureBytes;
+            if (exposure < needed) exposure = needed;
+            if (exposure > bar0->getLength()) exposure = bar0->getLength();
+            exposure &= ~static_cast<UInt64>(PAGE_SIZE - 1);
+            m_exposedVramBytes = exposure;
+            // Adoption may have widened the window so that the live surface is
+            // covered; keep the advertised System Information values consistent.
+            const UInt32 exposedMiB = static_cast<UInt32>(exposure >> 20);
+            setProperty("VRAM,totalMB", exposedMiB, 32);
+            setProperty("VanGoghDriver,VRAM-exposed-MiB", exposedMiB, 32);
+            if (m_pciDevice != nullptr)
+                m_pciDevice->setProperty("VRAM,totalMB", exposedMiB, 32);
+
+            const UInt64 aperturePhysical =
+                static_cast<UInt64>(bar0->getPhysicalAddress()) + translation.vramOffset;
+
+            setProperty("VanGoghFramebuffer,scanout-physical", aperturePhysical, 64);
+            setProperty("VanGoghFramebuffer,scanout-bytes", apertureBytes, 64);
+            setProperty("VanGoghFramebuffer,width", surface.widthPixels, 32);
+            setProperty("VanGoghFramebuffer,height", surface.heightPixels, 32);
+            setProperty("VanGoghFramebuffer,pitch", surface.pitchBytes, 32);
+            setProperty("VanGoghFramebuffer,refresh", 60, 32);
+            setProperty("VanGoghFramebuffer,display-width", displayWidth, 32);
+            setProperty("VanGoghFramebuffer,display-height", displayHeight, 32);
+            setProperty("VanGoghFramebuffer,rotation-programmed", rotated);
+            setProperty("VanGoghFramebuffer,linear-scanout", true);
+            setProperty("VanGoghFramebuffer,gpu-address-mapped", true);
+            setProperty("VanGoghFramebuffer,surface-programmed", true);
+            setProperty("VanGoghFramebuffer,vram-physical",
+                        static_cast<UInt64>(bar0->getPhysicalAddress()), 64);
+            setProperty("VanGoghFramebuffer,vram-bytes", exposure, 64);
+            setProperty("VanGoghFramebuffer,vram-mb",
+                        static_cast<UInt32>(exposure >> 20), 32);
+            setProperty("VanGoghFramebuffer,model", "AMD Van Gogh (Steam Deck)");
+            setProperty("VanGoghDriver,scanout-source", "firmware-live");
+            setProperty("VanGoghDriver,scanout-live-adopted", true);
+            setProperty("VanGoghDriver,scanout-live-hubp", hubp, 8);
+            setProperty("VanGoghDriver,scanout-live-panel-known", knownPanel);
+            setProperty("VanGoghDriver,scanout-vram-offset", translation.vramOffset, 64);
+            setProperty("VanGoghDriver,scanout-mc-address", surface.gpuAddress, 64);
+            setProperty("VanGoghDriver,gpuvm-scanout-ready", false);
+
+            m_liveScanoutAdopted = true;
+            m_liveVramOffset = translation.vramOffset;
+            m_liveApertureBytes = apertureBytes;
+
+            IOLog("VanGoghDriver: adopting live %s scanout HUBP%u %ux%u pitch %u rot %u, MC 0x%llx -> BAR0+0x%llx (%llu bytes), %llu MiB VRAM exposed%s\n",
+                  rotated ? "rotated-270" : "unrotated", hubp, surface.widthPixels,
+                  surface.heightPixels, surface.pitchBytes, surface.rotation,
+                  static_cast<unsigned long long>(surface.gpuAddress),
+                  static_cast<unsigned long long>(translation.vramOffset),
+                  static_cast<unsigned long long>(apertureBytes),
+                  static_cast<unsigned long long>(exposure >> 20),
+                  knownPanel ? "" : " (panel association unknown)");
+
+            // Publishing ready last is what lets the VanGoghFramebuffer personality match.
+            setProperty("VanGoghFramebuffer,ready", true);
+            return true;
+        }
+    }
+
+    IOLog("VanGoghDriver: no linear 800x1280 ARGB8888 live surface was adoptable (panel HUBP mask 0x%x); framebuffer not adopted\n",
+          m_panelHUBPMask);
+    return false;
 }
 
 // DCN 3.0.1 OTG register layout from AMD's dcn_3_0_1_offset.h. This stage is
@@ -821,6 +1090,17 @@ void VanGoghDriver::stop(IOService *provider) {
 }
 
 void VanGoghDriver::releaseDeviceResources() {
+    // Clear the personality gate first. The VanGoghFramebuffer nub matches on
+    // this property, so a stop/start cycle must not resurrect a stale aperture.
+    m_liveScanoutAdopted = false;
+    m_liveVramOffset = 0;
+    m_liveApertureBytes = 0;
+    m_exposedVramBytes = 0;
+    removeProperty("VanGoghFramebuffer,ready");
+    removeProperty("VanGoghFramebuffer,linear-scanout");
+    removeProperty("VanGoghFramebuffer,gpu-address-mapped");
+    removeProperty("VanGoghFramebuffer,surface-programmed");
+
     if (m_rotationRestoreMask != 0 && m_ipDiscovery != nullptr && m_registerMap != nullptr) {
         for (UInt8 hubp = 0; hubp < VanGoghDCN301::kHUBPCount; ++hubp) {
             if ((m_rotationRestoreMask & (1u << hubp)) == 0) continue;
@@ -1378,6 +1658,19 @@ void VanGoghDriver::programVramScanout(IOService *provider) {
     setProperty("VanGoghFramebuffer,gpu-address-mapped", true);
     setProperty("VanGoghFramebuffer,surface-programmed", true);
     setProperty("VanGoghFramebuffer,rotation-programmed", m_geom.rotated);
+    setProperty("VanGoghFramebuffer,display-width",
+                m_geom.rotated ? m_geom.heightPixels : m_geom.widthPixels, 32);
+    setProperty("VanGoghFramebuffer,display-height",
+                m_geom.rotated ? m_geom.widthPixels : m_geom.heightPixels, 32);
+    const UInt64 surfaceEnd = m_vramPlan.vramOffset + m_vramPlan.bytes;
+    UInt64 exposure = m_exposedVramBytes != 0 ? m_exposedVramBytes : m_vramPlan.limitEnd;
+    if (exposure > m_vramPlan.limitEnd) exposure = m_vramPlan.limitEnd;
+    if (exposure < surfaceEnd) exposure = surfaceEnd;
+    exposure &= ~static_cast<UInt64>(PAGE_SIZE - 1);
+    setProperty("VanGoghFramebuffer,vram-physical", m_bar0Physical, 64);
+    setProperty("VanGoghFramebuffer,vram-bytes", exposure, 64);
+    setProperty("VanGoghFramebuffer,vram-mb", static_cast<UInt32>(exposure >> 20), 32);
+    setProperty("VanGoghFramebuffer,model", "AMD Van Gogh (Steam Deck)");
     setProperty("VanGoghDriver,gpuvm-scanout-ready", true);
     IOLog("VanGoghDriver: programmed HUBP mask %x to scan out VRAM MC 0x%llx (%ux%u, %s)\n", pending,
           static_cast<unsigned long long>(m_vramPlan.mcAddress), m_geom.widthPixels, m_geom.heightPixels,

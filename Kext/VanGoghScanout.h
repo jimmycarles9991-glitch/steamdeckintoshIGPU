@@ -73,6 +73,37 @@ struct Geometry {
     bool rotated;       // true: HUBP rotates a landscape source to the portrait panel
 };
 
+// A description of the surface the display engine is already scanning. Used to
+// adopt a firmware/OpenCore GOP framebuffer as the macOS aperture without
+// writing any DCN register. Only linear, uncompressed ARGB8888 is accepted.
+constexpr uint32_t kMaxFramebufferDimension = 8192;
+constexpr uint32_t kMaxFramebufferPitchBytes = 32768;   // 8192 px * 4
+
+enum class LiveStatus : uint8_t {
+    Ok,
+    Unreadable,
+    FormatNotARGB8888,
+    NotLinearUncompressed,
+    ViewportInvalid,
+    PitchInvalid,
+    AddressInvalid
+};
+
+struct LiveSurface {
+    uint32_t widthPixels;   // viewport / source width
+    uint32_t heightPixels;  // viewport / source height
+    uint32_t pitchBytes;    // exact programmed row pitch
+    uint32_t rotation;      // 0..3, hardware encoding
+    uint64_t gpuAddress;    // as programmed in the surface address registers
+};
+
+LiveStatus describeLiveSurface(uint32_t surfaceConfig, uint32_t tilingConfig,
+                               uint32_t viewportDimension, uint32_t surfacePitch,
+                               uint32_t surfaceControl, uint32_t addressLow,
+                               uint32_t addressHigh, LiveSurface *out);
+const char *liveStatusName(LiveStatus status);
+bool isRotated270(const LiveSurface &surface);
+
 // ARGB8888 + rotation 270 + viewport within 1280x800  -> landscape source, rotated.
 // ARGB8888 + rotation 0   + viewport within 800x1280  -> native portrait, no rotation.
 // Anything else (other format/rotation/size, unreadable) -> ok == false.

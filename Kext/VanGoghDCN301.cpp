@@ -3,7 +3,7 @@
 namespace VanGoghDCN301 {
 
 bool registerDword(uint8_t hubp, Register reg, uint32_t *outDword) {
-    // Column order matches enum Register. Checked against Linux v6.18.44
+    // Column order matches enum Register. Checked against Linux's
     // dcn_3_0_1_offset.h by tools/verify_dcn301_registers.py.
     static constexpr uint32_t kRegisterDwords[kHUBPCount][kRegisterCount] = {
         {0x05E5, 0x05E7, 0x05EA, 0x0607, 0x060A, 0x060B, 0x061A, 0x0609, 0x05F3, 0x061B, 0x05E6},

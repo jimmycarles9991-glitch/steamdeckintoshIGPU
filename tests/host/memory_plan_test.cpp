@@ -82,5 +82,38 @@ int main() {
     CHECK(!o.ok && o.mcAddress == 0 && o.bytes == 0);
     CHECK(statusName(Status::NoRoom) != nullptr);
 
+    // Translate the address the boot firmware left in HUBP into BAR0 space.
+    const uint64_t fb = fbBaseFromRegister(0xF400);
+    const uint64_t surface = 1280ull * 4 * 800;
+    Translation t = translateMcAddress(fb + 16 * kMiB, surface, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.ok);
+    CHECK_EQ(t.vramOffset, 16 * kMiB);
+    CHECK_EQ(t.maxBytes, 256 * kMiB - 16 * kMiB);
+    CHECK(translationStatusName(t.status) != nullptr);
+
+    t = translateMcAddress(fb, surface, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.ok && t.vramOffset == 0 && t.maxBytes == 256 * kMiB);
+    t = translateMcAddress(fb - 4096, surface, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::AddressOutsideVram);
+    t = translateMcAddress(fb + 4096 * kMiB, surface, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::AddressOutsideVram);
+    t = translateMcAddress(fb + 4096 * kMiB - 4096, surface, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::SurfaceOutsideVram);
+    t = translateMcAddress(fb + 256 * kMiB - 4096, surface, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::Bar0TooSmall);
+    t = translateMcAddress(fb + 256 * kMiB, 4, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::Bar0TooSmall);
+    t = translateMcAddress(fb + 4096 + 256, surface, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::Misaligned);
+    t = translateMcAddress(fb, 0, fb, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::ZeroLength);
+    t = translateMcAddress(fb, surface, fb, 0, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::VramSizeInvalid);
+    t = translateMcAddress(fb, surface, fb + 4096, 4096 * kMiB, 256 * kMiB);
+    CHECK(t.status == TranslationStatus::FbLocationInvalid);
+    t = translateMcAddress(fb, surface, fb, 4096 * kMiB, 0);
+    CHECK(t.status == TranslationStatus::Bar0TooSmall);
+    CHECK(translationStatusName(TranslationStatus::Misaligned) != nullptr);
+
     FINISH("memory_plan_test");
 }

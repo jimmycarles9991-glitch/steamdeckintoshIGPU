@@ -82,4 +82,61 @@ const char *statusName(Status s) {
     return "unknown";
 }
 
+Translation translateMcAddress(uint64_t mcAddress, uint64_t surfaceBytes,
+                               uint64_t fbBase, uint64_t vramBytes,
+                               uint64_t bar0Length) {
+    Translation t;
+    if (surfaceBytes == 0) {
+        t.status = TranslationStatus::ZeroLength;
+        return t;
+    }
+    if (vramBytes == 0 || vramBytes > kMaxVramBytes) {
+        t.status = TranslationStatus::VramSizeInvalid;
+        return t;
+    }
+    if (fbBase >= kMaxGpuAddress || (fbBase & (kMiB - 1)) != 0) {
+        t.status = TranslationStatus::FbLocationInvalid;
+        return t;
+    }
+    if (mcAddress < fbBase || mcAddress - fbBase >= vramBytes) {
+        t.status = TranslationStatus::AddressOutsideVram;
+        return t;
+    }
+
+    const uint64_t offset = mcAddress - fbBase;
+    if (surfaceBytes > vramBytes - offset) {
+        t.status = TranslationStatus::SurfaceOutsideVram;
+        return t;
+    }
+    if (offset >= bar0Length || surfaceBytes > bar0Length - offset) {
+        t.status = TranslationStatus::Bar0TooSmall;
+        return t;
+    }
+    // A page-aligned base lets IOPCIFamily map the aperture with one mapping.
+    if ((offset & (kApertureAlign - 1)) != 0) {
+        t.status = TranslationStatus::Misaligned;
+        return t;
+    }
+
+    t.ok = true;
+    t.status = TranslationStatus::Ok;
+    t.vramOffset = offset;
+    t.maxBytes = (vramBytes < bar0Length ? vramBytes : bar0Length) - offset;
+    return t;
+}
+
+const char *translationStatusName(TranslationStatus status) {
+    switch (status) {
+        case TranslationStatus::Ok: return "ok";
+        case TranslationStatus::ZeroLength: return "zero-length surface";
+        case TranslationStatus::VramSizeInvalid: return "VRAM size invalid";
+        case TranslationStatus::FbLocationInvalid: return "MC FB base invalid";
+        case TranslationStatus::AddressOutsideVram: return "live address outside the VRAM window";
+        case TranslationStatus::SurfaceOutsideVram: return "live surface extends past VRAM";
+        case TranslationStatus::Bar0TooSmall: return "live surface is not CPU-visible through BAR0";
+        case TranslationStatus::Misaligned: return "live surface base is not page aligned";
+    }
+    return "unknown";
+}
+
 } // namespace VanGoghMemoryPlan

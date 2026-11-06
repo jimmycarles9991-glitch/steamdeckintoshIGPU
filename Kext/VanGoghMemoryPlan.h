@@ -11,6 +11,7 @@ namespace VanGoghMemoryPlan {
 constexpr uint64_t kKiB = 1024ull;
 constexpr uint64_t kMiB = 1024ull * 1024ull;
 constexpr uint64_t kScanoutAlign = 64 * kKiB;
+constexpr uint64_t kApertureAlign = 4 * kKiB;
 constexpr uint64_t kMaxVramBytes = 4096 * kMiB;
 constexpr uint64_t kMaxGpuAddress = 1ull << 48;          // HUBP address is 48 bits
 // Linux puts a 10 MiB PSP TMR near the top of VRAM (0xF4FE000000 on the Deck);
@@ -56,6 +57,33 @@ struct Output {
 // MC_VM_FB_LOCATION_* hold bits 47:24 in a 24-bit field.
 uint64_t fbBaseFromRegister(uint32_t reg);
 uint64_t fbTopFromRegister(uint32_t reg);
+
+// Translate a GPU/MC address that the display engine is already scanning into
+// an offset inside the CPU-visible BAR0 VRAM window. This does not resolve GPU
+// page tables: the caller must only use it when VMID0 is identity/disabled and
+// the address falls inside the MC framebuffer window.
+enum class TranslationStatus : uint8_t {
+    Ok,
+    ZeroLength,
+    VramSizeInvalid,
+    FbLocationInvalid,
+    AddressOutsideVram,
+    SurfaceOutsideVram,
+    Bar0TooSmall,
+    Misaligned
+};
+
+struct Translation {
+    bool ok = false;
+    TranslationStatus status = TranslationStatus::ZeroLength;
+    uint64_t vramOffset = 0;
+    uint64_t maxBytes = 0;          // bytes available from vramOffset to the window end
+};
+
+Translation translateMcAddress(uint64_t mcAddress, uint64_t surfaceBytes,
+                               uint64_t fbBase, uint64_t vramBytes,
+                               uint64_t bar0Length);
+const char *translationStatusName(TranslationStatus status);
 
 Output plan(const Input &in);
 const char *statusName(Status s);
