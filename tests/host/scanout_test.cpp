@@ -149,5 +149,55 @@ int main() {
     CHECK(!VanGoghDCN301::registerDword(0, static_cast<VanGoghDCN301::Register>(VanGoghDCN301::kRegisterCount), &v));
     CHECK(!VanGoghDCN301::registerDword(0, VanGoghDCN301::Register::SurfaceConfig, nullptr));
 
+    // Live-surface description used for the default firmware/OpenCore mirror.
+    LiveSurface s{};
+    CHECK(describeLiveSurface(0x00000008, 0x00000000, (1280u << 16) | 800u, 799u,
+                              0x00000000, 0x40000000u, 0x000000F4u, &s) == LiveStatus::Ok);
+    CHECK(!isRotated270(s));
+    CHECK_EQ(s.widthPixels, 800u);
+    CHECK_EQ(s.heightPixels, 1280u);
+    CHECK_EQ(s.pitchBytes, 3200u);
+    CHECK_EQ(s.rotation, 0u);
+    CHECK_EQ(s.gpuAddress, 0xF440000000ull);
+
+    CHECK(describeLiveSurface(0x00000308, 0x00000000, (800u << 16) | 1280u, 1280u - 1u,
+                              0x00000000, 0x00000000u, 0x000000F4u, &s) == LiveStatus::Ok);
+    CHECK(isRotated270(s));
+    CHECK(!isRotated270(LiveSurface{1280, 800, 5120, 1, 0xF400000000ull}));
+    CHECK_EQ(s.widthPixels, 1280u);
+    CHECK_EQ(s.heightPixels, 800u);
+    CHECK_EQ(s.pitchBytes, 5120u);
+    CHECK_EQ(s.rotation, 3u);
+
+    // DCC/tiling is the Linux-composited live state and cannot be adopted.
+    CHECK(describeLiveSurface(0x00000308, 0x0000081B, (800u << 16) | 1280u, 1280u - 1u,
+                              0x00000002, 0x40000000u, 0x000000F4u, &s) == LiveStatus::NotLinearUncompressed);
+    CHECK(describeLiveSurface(0x00000308, 0x00000000, (800u << 16) | 1280u, 1280u - 1u,
+                              0x00000002, 0x40000000u, 0x000000F4u, &s) == LiveStatus::NotLinearUncompressed);
+    CHECK(describeLiveSurface(0x00000003, 0x00000000, (1280u << 16) | 800u, 800u - 1u,
+                              0x00000000, 0x40000000u, 0x000000F4u, &s) == LiveStatus::FormatNotARGB8888);
+    CHECK(describeLiveSurface(UINT32_MAX, 0, (1280u << 16) | 800u, 800u - 1u,
+                              0, 0x40000000u, 0, &s) == LiveStatus::Unreadable);
+    CHECK(describeLiveSurface(0x00000008, 0, (1280u << 16) | 800u, 800u - 1u,
+                              0, 0x40000000u, 0, nullptr) == LiveStatus::Unreadable);
+    CHECK(describeLiveSurface(0x00000008, 0, 0, 800u - 1u,
+                              0, 0x40000000u, 0, &s) == LiveStatus::ViewportInvalid);
+    CHECK(describeLiveSurface(0x00000008, 0, ((kMaxFramebufferDimension + 1u) << 16) | 800u,
+                              800u - 1u, 0, 0x40000000u, 0, &s) == LiveStatus::ViewportInvalid);
+    CHECK(describeLiveSurface(0x00000008, 0, (1280u << 16) | 800u, 800u - 2u,
+                              0, 0x40000000u, 0, &s) == LiveStatus::PitchInvalid);
+    CHECK(describeLiveSurface(0x00000008, 0, (1280u << 16) | 800u, kMaxFramebufferPitchBytes / 4u,
+                              0, 0x40000000u, 0, &s) == LiveStatus::PitchInvalid);
+    CHECK(describeLiveSurface(0x00000008, 0, (1280u << 16) | 800u, 800u - 1u,
+                              0, 0, 0, &s) == LiveStatus::AddressInvalid);
+    CHECK(describeLiveSurface(0x00000008, 0, (1280u << 16) | 800u, 800u - 1u,
+                              0, 0x80u, 0, &s) == LiveStatus::AddressInvalid);
+    CHECK(describeLiveSurface(0x00000008, 0, (1280u << 16) | 800u, 800u - 1u,
+                              0, 0x00000000u, 0x00010000u, &s) == LiveStatus::AddressInvalid);
+    CHECK(describeLiveSurface(0x00000108, 0, (1280u << 16) | 800u, 800u - 1u,
+                              0, 0x40000000u, 0x000000F4u, &s) == LiveStatus::Ok);
+    CHECK_EQ(s.rotation, 1u);
+    CHECK(liveStatusName(LiveStatus::NotLinearUncompressed) != nullptr);
+
     FINISH("scanout_test");
 }
