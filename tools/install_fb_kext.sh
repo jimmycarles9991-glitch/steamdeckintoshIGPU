@@ -64,8 +64,14 @@ kmutil inspect -B "$scratch" --show-kext-uuids 2>/dev/null \
 }
 echo "  dry run carries $uuid"
 
-echo "  backing up $live"
-cp "$live" "$live.bak"
+if [ -f "$live" ]; then
+    echo "  backing up $live"
+    cp "$live" "$live.bak"
+    had_backup=1
+else
+    echo "  no existing $live; a fresh one will be written"
+    had_backup=0
+fi
 
 echo "  writing $live"
 kmutil create -n aux -a x86_64 --allow-missing-kdk \
@@ -83,5 +89,9 @@ then
 fi
 
 echo "THE LIVE COLLECTION DOES NOT CARRY $uuid - restoring the backup." >&2
-cp "$live.bak" "$live"
+if [ "$had_backup" = 1 ]; then
+    cp "$live.bak" "$live"
+else
+    rm -f "$live"
+fi
 exit 1

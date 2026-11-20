@@ -112,6 +112,25 @@ For a no-hardware-access load check, add `VanGoghDriver,probe-only` to the Steam
 
 This makes the PCI service publish its identity and return before opening the device or mapping any BARs. Remove the property to resume normal initialization. All custom OpenCore flags and numeric values are decoded from little-endian `OSData`; booleans should be encoded as `01 00 00 00` for true and `00 00 00 00` for false. The PCI path is derived from Linux's current topology; if your firmware exposes a different OpenCore path, use the GPU's actual path from your EFI/device tree.
 
+### Bisect a boot that hangs during initialization
+
+If the kext loads in `probe-only` mode but a full boot stalls, add `VanGoghDriver,diagnostic-stop-after` as 4-byte little-endian data on the same GPU device property path. Start at 1 and raise it by one until the boot stops; the driver publishes `VanGoghDriver,diagnostic-stage` with the last stage it reached and returns early instead of continuing into the next hardware step.
+
+| Value | Stops after |
+| --- | --- |
+| 1 | BAR5 mapped and VRAM lock allocated |
+| 2 | VRAM capacity read and published |
+| 3 | IP discovery table loaded |
+| 4 | MMHUB VMID0 inspection |
+| 5 | DCN301 rotation inspection |
+| 6 | DCN301 timing inspection |
+| 7 | DCN301 pipe routing inspection |
+| 8 | configured DCN301 rotation applied |
+| 9 | live-scanout adoption / panel allocation |
+| 10 | PSP ASD/TOC validation |
+
+`ioreg -r -c VanGoghDriver -l` then shows `diagnostic-stage` and `diagnostic-stopped`. Remove the property to run the full path again.
+
 ## Try rotating the currently active macOS display
 
 The framebuffer transform helper requests a 270-degree rotation on the currently active built-in macOS display and waits for CoreGraphics to report the new orientation. This tests the macOS display transform independently of this kext. On macOS, from the repository root:
