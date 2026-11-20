@@ -67,7 +67,7 @@ A service with `VanGoghDriver,attached = Yes` plus `VanGoghFramebuffer,ready = Y
 
 4. Set `SecureBootModel` to `Disabled` and `csr-active-config` to `FF0F0000` (SIP off, and not in `NVRAM > Delete`). This permits injected third-party kexts and rebuilding the auxiliary collection. Also set `Kernel -> Quirks -> DisableLinkeditJettison` to `true`.
 
-5. Reboot and check `kmutil showloaded | grep -i steamdeckintosh`, then use the diagnostics above. `VanGoghDriver,probe-only` (below) still gives a zero-hardware-access matching check.
+5. Reboot and check `kmutil showloaded | grep -i steamdeckintosh`. The injected kext is identity-only by default and performs no hardware access.
 
 ### Install the framebuffer kext into the auxiliary collection
 
@@ -94,46 +94,11 @@ sudo kmutil create -n aux -a x86_64 --allow-missing-kdk \
 
 `kmutil create` can exit 0 without writing anything when it refuses (for example a missing KDK); check the output with `kmutil inspect -B ... --show-kext-uuids`. `kmutil load -p /Library/Extensions/SteamDeckintoshFB.kext` loads it for the current boot only and does not survive a reboot. Reboot after installing, then check `kextstat | grep -i steamdeckintosh` and `ioreg -r -c VanGoghFramebuffer -l`.
 
-For a no-hardware-access load check, add `VanGoghDriver,probe-only` to the Steam Deck GPU’s OpenCore `DeviceProperties` as 4-byte little-endian data `AQAAAA==` (`01 00 00 00`). The live Linux PCI topology places GPU `04:00.0` behind bridge `00:08.1`, corresponding to this OpenCore path:
+Boot-time hardware access is disabled by default, so no `DeviceProperties` entry is needed for the injected kext. Opening the PCI provider and mapping BAR5 hangs the Steam Deck's Van Gogh APU during PCI configuration, so the injected kext only publishes PCI identity (`VanGoghDriver,identity-only = Yes`) and returns. No BAR is mapped and no GPU register is read. The old `VanGoghDriver,probe-only` property is still accepted for compatibility, but is no longer required.
 
-```xml
-<key>DeviceProperties</key>
-<dict>
-    <key>Add</key>
-    <dict>
-        <key>PciRoot(0x0)/Pci(0x8,0x1)/Pci(0x0,0x0)</key>
-        <dict>
-            <key>VanGoghDriver,probe-only</key>
-            <data>AQAAAA==</data>
-        </dict>
-    </dict>
-</dict>
-```
+The live Linux PCI topology places GPU `04:00.0` behind bridge `00:08.1`, corresponding to OpenCore path `PciRoot(0x0)/Pci(0x8,0x1)/Pci(0x0,0x0)`. Use the GPU's actual path if your firmware exposes a different one. `ioreg -r -c VanGoghDriver -l` shows the published identity properties.
 
-This makes the PCI service publish its identity and return before opening the device or mapping any BARs. Remove the property to resume normal initialization. All custom OpenCore flags and numeric values are decoded from little-endian `OSData`; booleans should be encoded as `01 00 00 00` for true and `00 00 00 00` for false. The PCI path is derived from Linux's current topology; if your firmware exposes a different OpenCore path, use the GPU's actual path from your EFI/device tree.
-
-### Bisect a boot that hangs during initialization
-
-If the kext loads in `probe-only` mode but a full boot stalls, add `VanGoghDriver,diagnostic-stop-after` as 4-byte little-endian data on the same GPU device property path. Start at 1 and raise it by one until the boot stops; the driver publishes `VanGoghDriver,diagnostic-stage` with the last stage it reached and returns early instead of continuing into the next hardware step.
-
-| Value | Stops after |
-| --- | --- |
-| 1 | PCI provider opened |
-| 2 | BAR5 descriptor read and validated |
-| 3 | PCI memory decoding enabled |
-| 4 | BAR5 mapping created |
-| 5 | VRAM lock allocated (BAR5 fully mapped) |
-| 6 | VRAM capacity read and published |
-| 7 | IP discovery table loaded |
-| 8 | MMHUB VMID0 inspection |
-| 9 | DCN301 rotation inspection |
-| 10 | DCN301 timing inspection |
-| 11 | DCN301 pipe routing inspection |
-| 12 | configured DCN301 rotation applied |
-| 13 | live-scanout adoption / panel allocation |
-| 14 | PSP ASD/TOC validation |
-
-`ioreg -r -c VanGoghDriver -l` then shows `diagnostic-stage` and `diagnostic-stopped`. Remove the property to run the full path again.
+The unfinished hardware path is gated behind `VanGoghDriver,unsafe-hardware-init` and is not used in normal boots. It exists only for future bring-up work from a non-boot context. All custom OpenCore numeric values are decoded from little-endian `OSData`; booleans are encoded as `01 00 00 00` for true and `00 00 00 00` for false.
 
 ## Try rotating the currently active macOS display
 

@@ -71,7 +71,6 @@ private:
     // provider/personality property and nothing below runs by default.
     bool boolProperty(IOService *provider, const char *key) const;
     bool numberProperty(IOService *provider, const char *key, UInt64 *value) const;
-    bool diagnosticStop(UInt32 stage);
     void planVramScanout(IOService *provider);
     bool writeVramPattern();
     void programVramScanout(IOService *provider);
@@ -104,7 +103,6 @@ private:
     bool m_memoryEnableChanged{false};
     bool m_providerOpened{false};
     UInt32 m_rotationRestoreMask{0};
-    UInt32 m_diagnosticStopAfter{0};
     UInt8 m_panelOTG{0xff};
     UInt32 m_panelOPPMask{0};
     UInt32 m_panelHUBPMask{0};
@@ -174,17 +172,11 @@ bool VanGoghDriver::start(IOService *provider) {
         return false;
     }
 
-    // Optional boot-time bisect: stop after a numbered hardware stage and
-    // publish the last stage reached. Unset means the full path runs.
-    UInt64 stopAfter = 0;
-    if (numberProperty(m_pciDevice, "VanGoghDriver,diagnostic-stop-after", &stopAfter) &&
-        stopAfter <= 14) {
-        m_diagnosticStopAfter = static_cast<UInt32>(stopAfter);
-    }
-
-    // A zero-I/O path for confirming OpenCore injection, PCI matching, and
-    // IOKit service publication before enabling any BAR or GPU access.
-    if (boolProperty(m_pciDevice, "VanGoghDriver,probe-only")) {
+    // Hardware access is disabled by default: opening the PCI provider and
+    // mapping BAR5 hangs boot on the Steam Deck's Van Gogh APU. Publish the
+    // PCI identity only, unless the caller explicitly opts into the unsafe
+    // hardware path (for future out-of-boot bring-up work).
+    if (!boolProperty(m_pciDevice, "VanGoghDriver,unsafe-hardware-init")) {
         const UInt8 revision = m_pciDevice->configRead8(kIOPCIConfigRevisionID);
         setProperty("model", "AMD Van Gogh (Steam Deck) probe-only");
         setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
@@ -192,11 +184,12 @@ bool VanGoghDriver::start(IOService *provider) {
         setProperty("VanGoghDriver,revision-id", revision, 8);
         setProperty("VanGoghDriver,attached", true);
         setProperty("VanGoghDriver,probe-only", true);
-        m_pciDevice->setProperty("model", "AMD Van Gogh (Steam Deck) probe-only");
+        setProperty("VanGoghDriver,identity-only", true);
+        m_pciDevice->setProperty("model", "AMD Van Gogh (Steam Deck) identity only");
         m_pciDevice->setProperty("VanGoghDriver,attached", true);
-        m_pciDevice->setProperty("VanGoghDriver,probe-only", true);
+        m_pciDevice->setProperty("VanGoghDriver,identity-only", true);
         registerService();
-        IOLog("VanGoghDriver: probe-only start succeeded for %04x:%04x rev %02x; no BAR/GPU access attempted\n",
+        IOLog("VanGoghDriver: identity-only start succeeded for %04x:%04x rev %02x; hardware init disabled\n",
               vendor, device, revision);
         return true;
     }
@@ -208,7 +201,6 @@ bool VanGoghDriver::start(IOService *provider) {
         return false;
     }
     m_providerOpened = true;
-    if (diagnosticStop(1)) return true;
 
     // BAR5 is the host's 512 KiB register aperture. Use the OS-published
     // descriptor and mapping; addresses are assigned at boot and are not fixed.
@@ -223,14 +215,12 @@ bool VanGoghDriver::start(IOService *provider) {
 
     m_registerPhysicalAddress = bar5->getPhysicalAddress();
     m_registerLength = bar5->getLength();
-    if (diagnosticStop(2)) return true;
     // Preserve the PCI command state and restore it if this driver enabled
     // memory decoding solely to map the BAR.
     const UInt16 pciCommand = m_pciDevice->configRead16(kPciConfigCommandRegister);
     m_memoryEnableWasSet = (pciCommand & kPciCommandMemorySpaceEnable) != 0;
     m_pciDevice->setMemoryEnable(true);
     m_memoryEnableChanged = !m_memoryEnableWasSet;
-    if (diagnosticStop(3)) return true;
     m_registerMap = m_pciDevice->mapDeviceMemoryWithRegister(bar5Register);
     if (m_registerMap == nullptr || m_registerMap->getLength() < m_registerLength) {
         IOLog("VanGoghDriver: could not map the complete PCI BAR5 register aperture\n");
@@ -238,7 +228,6 @@ bool VanGoghDriver::start(IOService *provider) {
         IOService::stop(provider);
         return false;
     }
-    if (diagnosticStop(4)) return true;
     m_vramAccessLock = IOLockAlloc();
     if (m_vramAccessLock == nullptr) {
         IOLog("VanGoghDriver: could not allocate VRAM access lock\n");
@@ -246,7 +235,6 @@ bool VanGoghDriver::start(IOService *provider) {
         IOService::stop(provider);
         return false;
     }
-    if (diagnosticStop(5)) return true;
 
     const UInt8 revision = m_pciDevice->configRead8(kIOPCIConfigRevisionID);
     IOLog("VanGoghDriver: attached to Van Gogh %04x:%04x rev %02x; BAR5 mapped at 0x%llx (%llu bytes)\n",
@@ -270,7 +258,6 @@ bool VanGoghDriver::start(IOService *provider) {
     } else {
         IOLog("VanGoghDriver: RCC_CONFIG_MEMSIZE readback invalid; advertising only the requested IOGraphics aperture\n");
     }
-    if (diagnosticStop(6)) return true;
 
     setProperty("model", "AMD Van Gogh Integrated Graphics");
     setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
@@ -282,17 +269,11 @@ bool VanGoghDriver::start(IOService *provider) {
     setProperty("VanGoghDriver,attached", true);
     m_pciDevice->setProperty("VanGoghDriver,attached", true);
     loadIPDiscovery(m_pciDevice);
-    if (diagnosticStop(7)) return true;
     inspectVanGoghVMID0();
-    if (diagnosticStop(8)) return true;
     inspectDCN301Rotation();
-    if (diagnosticStop(9)) return true;
     inspectDCN301Timing();
-    if (diagnosticStop(10)) return true;
     inspectDCN301PipeRouting();
-    if (diagnosticStop(11)) return true;
     applyConfiguredDCN301Rotation(m_pciDevice);
-    if (diagnosticStop(12)) return true;
     if (boolProperty(m_pciDevice, "VanGoghDriver,vram-scanout")) {
         planVramScanout(m_pciDevice);
         programVramScanout(m_pciDevice);
@@ -307,9 +288,7 @@ bool VanGoghDriver::start(IOService *provider) {
             IOLog("VanGoghDriver: no usable live scanout and no contiguous linear panel buffer; framebuffer remains disabled\n");
         }
     }
-    if (diagnosticStop(13)) return true;
     validatePSPFirmware(m_pciDevice);
-    if (diagnosticStop(14)) return true;
     OSData *panelEdid = OSData::withBytes(kSteamDeckPanelEDID, sizeof(kSteamDeckPanelEDID));
     if (panelEdid != nullptr) {
         setProperty("VanGoghFramebuffer,edid", panelEdid);
@@ -1435,21 +1414,6 @@ bool VanGoghDriver::numberProperty(IOService *provider, const char *key, UInt64 
     for (IOByteCount i = 0; i < data->getLength(); ++i)
         decoded |= static_cast<UInt64>(bytes[i]) << (i * 8);
     *value = decoded;
-    return true;
-}
-
-bool VanGoghDriver::diagnosticStop(UInt32 stage) {
-    setProperty("VanGoghDriver,diagnostic-stage", stage, 32);
-    if (m_pciDevice != nullptr) {
-        m_pciDevice->setProperty("VanGoghDriver,diagnostic-stage", stage, 32);
-    }
-    IOLog("VanGoghDriver: diagnostic stage %u reached\n", stage);
-    if (m_diagnosticStopAfter != stage) return false;
-    setProperty("VanGoghDriver,diagnostic-stopped", true);
-    if (m_pciDevice != nullptr) {
-        m_pciDevice->setProperty("VanGoghDriver,diagnostic-stopped", true);
-    }
-    registerService();
     return true;
 }
 
