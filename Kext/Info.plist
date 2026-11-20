@@ -24,8 +24,6 @@
 	<dict>
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>1.0.0</string>
-		<key>com.apple.iokit.IOGraphicsFamily</key>
-		<string>1.0.0</string>
 		<key>com.apple.kpi.iokit</key>
 		<string>8.0.0</string>
 		<key>com.apple.kpi.libkern</key>
@@ -53,22 +51,6 @@
 			<string>IOPCIDevice</string>
 			<key>IOMatchCategory</key>
 			<string>com.steamdeckintosh.vangogh</string>
-		</dict>
-		<key>VanGoghFramebuffer</key>
-		<dict>
-			<key>CFBundleIdentifier</key>
-			<string>com.steamdeckintosh.vangogh</string>
-			<key>IOClass</key>
-			<string>VanGoghFramebuffer</string>
-			<key>IOProviderClass</key>
-			<string>VanGoghDriver</string>
-			<key>IOMatchCategory</key>
-			<string>IOFramebuffer</string>
-			<key>IOPropertyMatch</key>
-			<dict>
-				<key>VanGoghFramebuffer,ready</key>
-				<true/>
-			</dict>
 		</dict>
 	</dict>
 </dict>

@@ -4,7 +4,7 @@ Experimental macOS graphics-driver development for the AMD Van Gogh iGPU in the 
 
 ## Current driver state
 
-The kext uses a `VanGoghDriver` PCI service and a `VanGoghFramebuffer` nub in the same bundle. The PCI service validates the matched PCI ID, opens the provider, enables PCI memory decoding as needed, maps BAR5 using the OS-published resource length, and restores the prior decoding state on failure or detach. It waits for PSP IFWI-ready, copies and validates the AMD IP discovery TMR through the BAR5 `MM_INDEX/MM_DATA` window, validates optional PSP ASD/TOC containers without submitting them, and reads live MMHUB VMID0 and DCN301 HUBP/OTG/ODM/MPCC state.
+The driver is split into two bundles. `SteamDeckintosh.kext` (`VanGoghDriver`) is OpenCore-injected from the boot kernel collection and contains no `IOGraphicsFamily` dependency. `SteamDeckintoshFB.kext` (`VanGoghFramebuffer`) is installed into the auxiliary kernel collection because `IOGraphicsFamily` lives in the system collection. The PCI service validates the matched PCI ID, opens the provider, enables PCI memory decoding as needed, maps BAR5 using the OS-published resource length, and restores the prior decoding state on failure or detach. It waits for PSP IFWI-ready, copies and validates the AMD IP discovery TMR through the BAR5 `MM_INDEX/MM_DATA` window, validates optional PSP ASD/TOC containers without submitting them, and reads live MMHUB VMID0 and DCN301 HUBP/OTG/ODM/MPCC state.
 
 The default framebuffer path is now **read-only live-scanout adoption**. If the boot firmware/OpenCore left the internal eDP pipe scanning a linear, uncompressed ARGB8888 surface, the driver translates that surface's MC address into the CPU-visible BAR0 window and publishes the exact aperture plus a 128 MiB `VRAM,totalMB` / `IOFBMemorySize` window to IOGraphics. macOS then draws into the memory the display engine is already scanning. No DCN register is written on this path.
 
@@ -23,18 +23,22 @@ Those properties are optional. The live-scanout path publishes `VanGoghDriver,sc
 
 ### Verify kext matching and framebuffer publication
 
-The PCI personality uses an exact `IOPCIPrimaryMatch` for Van Gogh `1002:163F`. On boot, `VanGoghDriver` logs probe, start, adoption, and start-complete messages. Check whether the kext is loaded with `kmutil showloaded | grep com.steamdeckintosh.vangogh`, inspect the matched service with `ioreg -r -c VanGoghDriver -l`, and read boot messages with:
+The PCI personality uses an exact `IOPCIPrimaryMatch` for Van Gogh `1002:163F`. On boot, `VanGoghDriver` logs probe, start, adoption, and start-complete messages. Check both bundles with `kmutil showloaded | grep -i steamdeckintosh`, inspect the matched service with `ioreg -r -c VanGoghDriver -l`, and read boot messages with:
 
 ```sh
 log show --last boot --predicate 'eventMessage CONTAINS "VanGogh"'
 ioreg -r -c VanGoghFramebuffer -l
 ```
 
-A service with `VanGoghDriver,attached = Yes` plus `VanGoghFramebuffer,ready = Yes` means the PCI kext started and the framebuffer nub was published. That does not mean acceleration exists. If `scanout-live-adopted` is absent, look for the `adopting live ... scanout` line or the specific refusal reason in the log.
+A service with `VanGoghDriver,attached = Yes` plus `VanGoghFramebuffer,ready = Yes` means the PCI kext started and published the properties the framebuffer kext matches on. That does not mean acceleration exists. If `scanout-live-adopted` is absent, look for the `adopting live ... scanout` line or the specific refusal reason in the log.
 
-### Load the kext with OpenCore
+### Why the framebuffer is a separate kext
 
-1. Build `SteamDeckintosh.kext` (Xcode on macOS, or the GitHub Actions artifact), copy it to `EFI/OC/Kexts/`, and add it under `Kernel -> Add`:
+`IOGraphicsFamily` is in `SystemKernelExtensions.kc`. OpenCore links injected kexts only against the boot collection, so a kext in `EFI/OC/Kexts` that declares `com.apple.iokit.IOGraphicsFamily` fails prelinking with `Prelinked injection ... - Invalid Parameter`. `SteamDeckintosh.kext` therefore has no `IOGraphicsFamily` dependency. `SteamDeckintoshFB.kext` declares it and is loaded into `AuxiliaryKernelExtensions.kc` instead.
+
+### Install the driver kext with OpenCore
+
+1. Build both bundles (Xcode on macOS, or the GitHub Actions artifact `SteamDeckintosh-VanGogh-kexts`). Copy **only** `SteamDeckintosh.kext` to `EFI/OC/Kexts/` and add it under `Kernel -> Add`:
 
    ```xml
    <dict>
@@ -57,11 +61,38 @@ A service with `VanGoghDriver,attached = Yes` plus `VanGoghFramebuffer,ready = Y
    </dict>
    ```
 
-2. Use a recoverable setup (USB EFI, `-v keepsyms=1 debug=0x100`) and keep a known-good config. The kext is unsigned and is intended for local testing.
+2. Do **not** add `SteamDeckintoshFB.kext` to `Kernel -> Add`. It links against `IOGraphicsFamily` and must go into the auxiliary kernel collection (next section).
 
-3. Ensure macOS will load an unsigned injected kext: set `SecureBootModel` to `Disabled` and use a SIP configuration that permits third-party kexts (a common hackintosh starting point is `csr-active-config` `0x00000000` with `SecureBootModel=Disabled`; this varies by macOS version). Also set `Kernel -> Quirks -> DisableLinkeditJettison` to `true`.
+3. Use a recoverable setup (USB EFI, `-v keepsyms=1 debug=0x100`) and keep a known-good config. Both kexts are unsigned and intended for local testing.
 
-4. Reboot and check `kmutil showloaded | grep com.steamdeckintosh.vangogh`, then use the diagnostics above. `VanGoghDriver,probe-only` (below) still gives a zero-hardware-access matching check.
+4. Set `SecureBootModel` to `Disabled` and `csr-active-config` to `FF0F0000` (SIP off, and not in `NVRAM > Delete`). This permits injected third-party kexts and rebuilding the auxiliary collection. Also set `Kernel -> Quirks -> DisableLinkeditJettison` to `true`.
+
+5. Reboot and check `kmutil showloaded | grep -i steamdeckintosh`, then use the diagnostics above. `VanGoghDriver,probe-only` (below) still gives a zero-hardware-access matching check.
+
+### Install the framebuffer kext into the auxiliary collection
+
+On macOS, with the artifact unpacked:
+
+```sh
+sudo tools/install_fb_kext.sh /path/to/SteamDeckintosh-VanGogh-kexts/SteamDeckintoshFB.kext
+```
+
+The script stages the kext in `/Library/Extensions`, ad-hoc signs it, builds a scratch auxiliary collection, verifies that the built binary's UUID is inside it, backs up `/Library/KernelCollections/AuxiliaryKernelExtensions.kc`, writes the new collection, verifies the UUID again, and restores the backup on failure.
+
+Manual equivalent:
+
+```sh
+sudo cp -R SteamDeckintoshFB.kext /Library/Extensions/
+sudo chown -R root:wheel /Library/Extensions/SteamDeckintoshFB.kext
+sudo codesign -f -s - /Library/Extensions/SteamDeckintoshFB.kext
+sudo kmutil create -n aux -a x86_64 --allow-missing-kdk \
+    -B /System/Library/KernelCollections/BootKernelExtensions.kc \
+    -S /System/Library/KernelCollections/SystemKernelExtensions.kc \
+    -A /Library/KernelCollections/AuxiliaryKernelExtensions.kc \
+    -r /Library/Extensions
+```
+
+`kmutil create` can exit 0 without writing anything when it refuses (for example a missing KDK); check the output with `kmutil inspect -B ... --show-kext-uuids`. `kmutil load -p /Library/Extensions/SteamDeckintoshFB.kext` loads it for the current boot only and does not survive a reboot. Reboot after installing, then check `kextstat | grep -i steamdeckintosh` and `ioreg -r -c VanGoghFramebuffer -l`.
 
 For a no-hardware-access load check, add `VanGoghDriver,probe-only` to the Steam Deck GPU’s OpenCore `DeviceProperties` as 4-byte little-endian data `AQAAAA==` (`01 00 00 00`). The live Linux PCI topology places GPU `04:00.0` behind bridge `00:08.1`, corresponding to this OpenCore path:
 
@@ -111,7 +142,7 @@ Host tests: `make test`. Compile every kext source for macOS with a real clang (
 
 ## Build
 
-GitHub Actions builds an unsigned x86_64 bundle on a macOS runner and uploads it as an artifact. This Linux workspace cannot run Apple's `xcodebuild`. The workflow has not run until the project is pushed to a GitHub repository.
+GitHub Actions builds two unsigned x86_64 bundles on a macOS runner and uploads them together as `SteamDeckintosh-VanGogh-kexts`: `SteamDeckintosh.kext` (OpenCore-injected, no `IOGraphicsFamily`) and `SteamDeckintoshFB.kext` (auxiliary collection, links `IOGraphicsFamily`). This Linux workspace cannot run Apple's `xcodebuild`. The workflow has not run until the project is pushed to a GitHub repository.
 
 The local `VFCT.bin` is a hardware diagnostic dump, not a macOS driver resource. The default live-scanout path can provide an unaccelerated built-in-panel framebuffer, but HDMI/external displays, acceleration, backlight, and real AUX/EDID are not implemented. Install it only on a recoverable setup.
 
