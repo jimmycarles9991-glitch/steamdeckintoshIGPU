@@ -178,7 +178,7 @@ bool VanGoghDriver::start(IOService *provider) {
     // publish the last stage reached. Unset means the full path runs.
     UInt64 stopAfter = 0;
     if (numberProperty(m_pciDevice, "VanGoghDriver,diagnostic-stop-after", &stopAfter) &&
-        stopAfter <= 10) {
+        stopAfter <= 14) {
         m_diagnosticStopAfter = static_cast<UInt32>(stopAfter);
     }
 
@@ -208,6 +208,7 @@ bool VanGoghDriver::start(IOService *provider) {
         return false;
     }
     m_providerOpened = true;
+    if (diagnosticStop(1)) return true;
 
     // BAR5 is the host's 512 KiB register aperture. Use the OS-published
     // descriptor and mapping; addresses are assigned at boot and are not fixed.
@@ -222,12 +223,14 @@ bool VanGoghDriver::start(IOService *provider) {
 
     m_registerPhysicalAddress = bar5->getPhysicalAddress();
     m_registerLength = bar5->getLength();
+    if (diagnosticStop(2)) return true;
     // Preserve the PCI command state and restore it if this driver enabled
     // memory decoding solely to map the BAR.
     const UInt16 pciCommand = m_pciDevice->configRead16(kPciConfigCommandRegister);
     m_memoryEnableWasSet = (pciCommand & kPciCommandMemorySpaceEnable) != 0;
     m_pciDevice->setMemoryEnable(true);
     m_memoryEnableChanged = !m_memoryEnableWasSet;
+    if (diagnosticStop(3)) return true;
     m_registerMap = m_pciDevice->mapDeviceMemoryWithRegister(bar5Register);
     if (m_registerMap == nullptr || m_registerMap->getLength() < m_registerLength) {
         IOLog("VanGoghDriver: could not map the complete PCI BAR5 register aperture\n");
@@ -235,6 +238,7 @@ bool VanGoghDriver::start(IOService *provider) {
         IOService::stop(provider);
         return false;
     }
+    if (diagnosticStop(4)) return true;
     m_vramAccessLock = IOLockAlloc();
     if (m_vramAccessLock == nullptr) {
         IOLog("VanGoghDriver: could not allocate VRAM access lock\n");
@@ -242,7 +246,7 @@ bool VanGoghDriver::start(IOService *provider) {
         IOService::stop(provider);
         return false;
     }
-    if (diagnosticStop(1)) return true;
+    if (diagnosticStop(5)) return true;
 
     const UInt8 revision = m_pciDevice->configRead8(kIOPCIConfigRevisionID);
     IOLog("VanGoghDriver: attached to Van Gogh %04x:%04x rev %02x; BAR5 mapped at 0x%llx (%llu bytes)\n",
@@ -266,7 +270,7 @@ bool VanGoghDriver::start(IOService *provider) {
     } else {
         IOLog("VanGoghDriver: RCC_CONFIG_MEMSIZE readback invalid; advertising only the requested IOGraphics aperture\n");
     }
-    if (diagnosticStop(2)) return true;
+    if (diagnosticStop(6)) return true;
 
     setProperty("model", "AMD Van Gogh Integrated Graphics");
     setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
@@ -278,17 +282,17 @@ bool VanGoghDriver::start(IOService *provider) {
     setProperty("VanGoghDriver,attached", true);
     m_pciDevice->setProperty("VanGoghDriver,attached", true);
     loadIPDiscovery(m_pciDevice);
-    if (diagnosticStop(3)) return true;
-    inspectVanGoghVMID0();
-    if (diagnosticStop(4)) return true;
-    inspectDCN301Rotation();
-    if (diagnosticStop(5)) return true;
-    inspectDCN301Timing();
-    if (diagnosticStop(6)) return true;
-    inspectDCN301PipeRouting();
     if (diagnosticStop(7)) return true;
-    applyConfiguredDCN301Rotation(m_pciDevice);
+    inspectVanGoghVMID0();
     if (diagnosticStop(8)) return true;
+    inspectDCN301Rotation();
+    if (diagnosticStop(9)) return true;
+    inspectDCN301Timing();
+    if (diagnosticStop(10)) return true;
+    inspectDCN301PipeRouting();
+    if (diagnosticStop(11)) return true;
+    applyConfiguredDCN301Rotation(m_pciDevice);
+    if (diagnosticStop(12)) return true;
     if (boolProperty(m_pciDevice, "VanGoghDriver,vram-scanout")) {
         planVramScanout(m_pciDevice);
         programVramScanout(m_pciDevice);
@@ -303,9 +307,9 @@ bool VanGoghDriver::start(IOService *provider) {
             IOLog("VanGoghDriver: no usable live scanout and no contiguous linear panel buffer; framebuffer remains disabled\n");
         }
     }
-    if (diagnosticStop(9)) return true;
+    if (diagnosticStop(13)) return true;
     validatePSPFirmware(m_pciDevice);
-    if (diagnosticStop(10)) return true;
+    if (diagnosticStop(14)) return true;
     OSData *panelEdid = OSData::withBytes(kSteamDeckPanelEDID, sizeof(kSteamDeckPanelEDID));
     if (panelEdid != nullptr) {
         setProperty("VanGoghFramebuffer,edid", panelEdid);

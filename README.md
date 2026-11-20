@@ -118,16 +118,20 @@ If the kext loads in `probe-only` mode but a full boot stalls, add `VanGoghDrive
 
 | Value | Stops after |
 | --- | --- |
-| 1 | BAR5 mapped and VRAM lock allocated |
-| 2 | VRAM capacity read and published |
-| 3 | IP discovery table loaded |
-| 4 | MMHUB VMID0 inspection |
-| 5 | DCN301 rotation inspection |
-| 6 | DCN301 timing inspection |
-| 7 | DCN301 pipe routing inspection |
-| 8 | configured DCN301 rotation applied |
-| 9 | live-scanout adoption / panel allocation |
-| 10 | PSP ASD/TOC validation |
+| 1 | PCI provider opened |
+| 2 | BAR5 descriptor read and validated |
+| 3 | PCI memory decoding enabled |
+| 4 | BAR5 mapping created |
+| 5 | VRAM lock allocated (BAR5 fully mapped) |
+| 6 | VRAM capacity read and published |
+| 7 | IP discovery table loaded |
+| 8 | MMHUB VMID0 inspection |
+| 9 | DCN301 rotation inspection |
+| 10 | DCN301 timing inspection |
+| 11 | DCN301 pipe routing inspection |
+| 12 | configured DCN301 rotation applied |
+| 13 | live-scanout adoption / panel allocation |
+| 14 | PSP ASD/TOC validation |
 
 `ioreg -r -c VanGoghDriver -l` then shows `diagnostic-stage` and `diagnostic-stopped`. Remove the property to run the full path again.
 
