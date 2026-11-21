@@ -11,6 +11,7 @@ test: $(BUILD)/memory_plan_test $(BUILD)/scanout_test $(BUILD)/init_gate_test
 	$(BUILD)/scanout_test
 	$(BUILD)/init_gate_test
 	python3 tests/tools/test_hubp_dump.py
+	python3 tests/tools/test_probe_provider.py
 
 $(BUILD)/init_gate_test: tests/host/init_gate_test.cpp Kext/VanGoghInitGate.h tests/host/check.h
 	@mkdir -p $(BUILD)

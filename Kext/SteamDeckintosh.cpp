@@ -169,7 +169,13 @@ OSDefineMetaClassAndStructors(VanGoghDriver, IOService)
 
 IOService *VanGoghDriver::probe(IOService *provider, SInt32 *score) {
     IOService *matched = IOService::probe(provider, score);
-    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, matched);
+    if (matched == nullptr) {
+        return nullptr;
+    }
+
+    // IOService::probe() returns the driver instance (this), not the provider.
+    // The PCI device we need to inspect is the provider passed in by IOKit.
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
     if (pci == nullptr) {
         IOLog("VanGoghDriver: probe rejected non-PCI provider\n");
         return nullptr;
