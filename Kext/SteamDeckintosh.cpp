@@ -17,6 +17,9 @@
 #include <libkern/c++/OSNumber.h>
 
 namespace {
+struct VanGoghBootTrace {
+    VanGoghBootTrace() { IOLog("VanGoghDriver: [trace 1] kext static init\n"); }
+} gVanGoghBootTrace;
 constexpr UInt32 kPciConfigCommandRegister = 0x04;
 constexpr UInt16 kPciCommandMemorySpaceEnable = 1u << 1;
 constexpr UInt32 kMmIndexRegister = 0x0000;
@@ -77,6 +80,7 @@ class VanGoghDriver : public IOService {
     OSDeclareDefaultStructors(VanGoghDriver)
 
 public:
+    bool init(OSDictionary *dictionary = nullptr) override;
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
@@ -167,7 +171,15 @@ private:
 
 OSDefineMetaClassAndStructors(VanGoghDriver, IOService)
 
+// Boot-trace markers: each prints once, in order, so the last one visible on
+// the -v screen shows exactly where a boot stalls.
+bool VanGoghDriver::init(OSDictionary *dictionary) {
+    IOLog("VanGoghDriver: [trace 2] init\n");
+    return IOService::init(dictionary);
+}
+
 IOService *VanGoghDriver::probe(IOService *provider, SInt32 *score) {
+    IOLog("VanGoghDriver: [trace 3] probe entered\n");
     IOService *matched = IOService::probe(provider, score);
     if (matched == nullptr) {
         return nullptr;
