@@ -4,7 +4,9 @@ Experimental macOS graphics-driver development for the AMD Van Gogh iGPU in the 
 
 ## Current driver state
 
-The driver is split into two bundles. `SteamDeckintosh.kext` (`VanGoghDriver`) is OpenCore-injected from the boot kernel collection and contains no `IOGraphicsFamily` dependency. `SteamDeckintoshFB.kext` (`VanGoghFramebuffer`) is installed into the auxiliary kernel collection because `IOGraphicsFamily` lives in the system collection. The PCI service validates the matched PCI ID, opens the provider, enables PCI memory decoding as needed, maps BAR5 using the OS-published resource length, and restores the prior decoding state on failure or detach. It waits for PSP IFWI-ready, copies and validates the AMD IP discovery TMR through the BAR5 `MM_INDEX/MM_DATA` window, validates optional PSP ASD/TOC containers without submitting them, and reads live MMHUB VMID0 and DCN301 HUBP/OTG/ODM/MPCC state.
+The driver is split into two bundles. `SteamDeckintosh.kext` (`VanGoghDriver`) is OpenCore-injected from the boot kernel collection and contains no `IOGraphicsFamily` dependency. `SteamDeckintoshFB.kext` (`VanGoghFramebuffer`) is installed into the auxiliary kernel collection because `IOGraphicsFamily` lives in the system collection.
+
+On the boot path the PCI service only validates the matched PCI ID and publishes identity properties. It does not open the provider, enable memory decode, map BAR5, poll a register, or sleep: doing any of that while OpenCore is still linking the boot collection stalls the Van Gogh APU. Optional hardware work is deferred to a `thread_call` after boot (see [PSP readiness gate](#psp-readiness-gate-and-deferred-bring-up)). When enabled, that worker opens the provider, maps BAR5 using the OS-published resource length, restores prior decoding state on failure or detach, waits for PSP readiness with bounded polls, then copies and validates the AMD IP discovery TMR through the BAR5 `MM_INDEX/MM_DATA` window, validates optional PSP ASD/TOC containers without submitting them, and reads live MMHUB VMID0 and DCN301 HUBP/OTG/ODM/MPCC state.
 
 The default framebuffer path is now **read-only live-scanout adoption**. If the boot firmware/OpenCore left the internal eDP pipe scanning a linear, uncompressed ARGB8888 surface, the driver translates that surface's MC address into the CPU-visible BAR0 window and publishes the exact aperture plus a 128 MiB `VRAM,totalMB` / `IOFBMemorySize` window to IOGraphics. macOS then draws into the memory the display engine is already scanning. No DCN register is written on this path.
 
@@ -35,6 +37,25 @@ A service with `VanGoghDriver,attached = Yes` plus `VanGoghFramebuffer,ready = Y
 ### Why the framebuffer is a separate kext
 
 `IOGraphicsFamily` is in `SystemKernelExtensions.kc`. OpenCore links injected kexts only against the boot collection, so a kext in `EFI/OC/Kexts` that declares `com.apple.iokit.IOGraphicsFamily` fails prelinking with `Prelinked injection ... - Invalid Parameter`. `SteamDeckintosh.kext` therefore has no `IOGraphicsFamily` dependency. `SteamDeckintoshFB.kext` declares it and is loaded into `AuxiliaryKernelExtensions.kc` instead.
+
+### PSP readiness gate and deferred bring-up
+
+Hardware work is opt-in and never runs on the boot thread. Set one of these on the PCI device (`1002:163F`):
+
+| Property | Type | Effect |
+| --- | --- | --- |
+| `VanGoghDriver,deferred-hardware-init` | bool | Schedule the hardware worker ~3 s after `start()` returns. |
+| `VanGoghDriver,unsafe-hardware-init` | bool | Accepted alias for the property above; no longer runs inside `start()`. |
+
+The wait sequence and register offsets come from the Linux `amdgpu` driver for the Deck's exact kernel (`v6.18.44`; see `make fetch-linux-ref`):
+
+1. `MP0_SMN_C2PMSG_35` bit 31 with mask `0x8000FFFF` must read `0x80000000` — `psp_v11_0_wait_for_bootloader()` in `psp_v11_0.c`. The old code only checked `C2PMSG_33`, which is the *IFWI-init* bit used by `amdgpu_discovery.c`, not the bootloader-ready gate.
+2. `MP0_SMN_C2PMSG_33` bit 31 must then read 1 — the 2000 x 1 ms discovery wait.
+3. Only after both pass does the worker set its internal hardware-ready flag. Every normal `readRegister32`/`writeRegister32` refuses access until then; the gate uses a separate `readEarlyRegister32` that touches only those two registers.
+
+Both waits are bounded (`VanGoghInitGate`: 1000 x 1 ms for the bootloader, 2000 x 1 ms for IFWI). There is no unbounded polling anywhere in the kext. `stop()` calls `thread_call_cancel_wait()` before releasing BAR5/IP state, so teardown cannot race the worker. The log publishes `VanGoghDriver,hardware-init-stage` before each hardware phase (1 opening … 15 complete, 99 failed) so a future hang can be localized from `ioreg` without boot bisection. A failed gate publishes `VanGoghDriver,hardware-init-failed` and performs no further GPU MMIO.
+
+`Kext/VanGoghInitGate.h` is pure policy with no IOKit dependency; `make test` exercises every gate outcome (ready, delayed, timeout, read failure) with fake register callbacks.
 
 ### Install the driver kext with OpenCore
 
@@ -94,11 +115,11 @@ sudo kmutil create -n aux -a x86_64 --allow-missing-kdk \
 
 `kmutil create` can exit 0 without writing anything when it refuses (for example a missing KDK); check the output with `kmutil inspect -B ... --show-kext-uuids`. `kmutil load -p /Library/Extensions/SteamDeckintoshFB.kext` loads it for the current boot only and does not survive a reboot. Reboot after installing, then check `kextstat | grep -i steamdeckintosh` and `ioreg -r -c VanGoghFramebuffer -l`.
 
-Boot-time hardware access is disabled by default, so no `DeviceProperties` entry is needed for the injected kext. Opening the PCI provider and mapping BAR5 hangs the Steam Deck's Van Gogh APU during PCI configuration, so the injected kext only publishes PCI identity (`VanGoghDriver,identity-only = Yes`) and returns. No BAR is mapped and no GPU register is read. The old `VanGoghDriver,probe-only` property is still accepted for compatibility, but is no longer required.
+Boot-time hardware access is disabled unconditionally, so no `DeviceProperties` entry is needed for the injected kext. Opening the PCI provider and mapping BAR5 hangs the Steam Deck's Van Gogh APU during PCI configuration, so `start()` only publishes PCI identity (`VanGoghDriver,identity-only = Yes`) and returns. No BAR is mapped, no register is read, and no sleep occurs on the boot path. The old `VanGoghDriver,probe-only` property is still accepted for compatibility, but is no longer required.
 
 The live Linux PCI topology places GPU `04:00.0` behind bridge `00:08.1`, corresponding to OpenCore path `PciRoot(0x0)/Pci(0x8,0x1)/Pci(0x0,0x0)`. Use the GPU's actual path if your firmware exposes a different one. `ioreg -r -c VanGoghDriver -l` shows the published identity properties.
 
-The unfinished hardware path is gated behind `VanGoghDriver,unsafe-hardware-init` and is not used in normal boots. It exists only for future bring-up work from a non-boot context. All custom OpenCore numeric values are decoded from little-endian `OSData`; booleans are encoded as `01 00 00 00` for true and `00 00 00 00` for false.
+The unfinished hardware path is gated behind `VanGoghDriver,deferred-hardware-init` (or the `unsafe-hardware-init` alias) and is not used in normal boots. It runs from a deferred worker, behind the bounded PSP gate described above, not from `start()`. All custom OpenCore numeric values are decoded from little-endian `OSData`; booleans are encoded as `01 00 00 00` for true and `00 00 00 00` for false.
 
 ## Try rotating the currently active macOS display
 
@@ -126,7 +147,7 @@ The live-scanout path above is the safe default and does not write DCN registers
 
 The HUBP stage picks its surface from what the panel pipe is scanning: ARGB8888 rotated 270 within 1280x800 gives a rotated 1280x800 surface; ARGB8888 unrotated within 800x1280 (the likely firmware state) gives a native 800x1280 portrait surface with no rotation. Anything else is refused and the raw live values are logged. It validates every target before writing any, verifies by readback, and rolls back on failure and on detach. It publishes `ready` once the planes verify. Check the log lines starting `VanGoghDriver:` (`log show --predicate 'eventMessage CONTAINS "VanGogh"' --last boot`) and `ioreg -l | grep -i vangogh`.
 
-Host tests: `make test`. Compile every kext source for macOS with a real clang (`pip install ziglang`, MacKernelSDK cloned beside the repo): `make compile-check`. Register cross-check against Linux's `dcn_3_0_1_offset.h` (defaults to `v6.6`, pass `--ref` for another tag): `make verify-registers`.
+Host tests (including the bounded PSP gate): `make test`. Compile every kext source for macOS with a real clang (`pip install ziglang`, MacKernelSDK cloned beside the repo): `make compile-check`. Register cross-check against Linux's `dcn_3_0_1_offset.h` (defaults to `v6.6`, pass `--ref` for another tag): `make verify-registers`. Download the matching `amdgpu` sources used for the readiness sequence and register checks: `make fetch-linux-ref` (defaults to `v6.18.44`, override with `KERNEL_REF=...` and an output directory argument).
 
 ## Build
 

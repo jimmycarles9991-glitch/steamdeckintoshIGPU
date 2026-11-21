@@ -3,8 +3,11 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <libkern/c++/OSData.h>
 #include "SteamDeckPanelEDID.h"
+#include "VanGoghInitGate.h"
 #include "VanGoghDCN301.h"
 #include "VanGoghFirmware.h"
 #include "VanGoghIPDiscovery.h"
@@ -20,7 +23,6 @@ constexpr UInt32 kMmIndexRegister = 0x0000;
 constexpr UInt32 kMmDataRegister = 0x0004;
 constexpr UInt32 kMmIndexHighRegister = 0x0018;
 constexpr UInt32 kRccConfigMemsizeRegister = 0x0DE3 * sizeof(UInt32);
-constexpr UInt32 kMp0C2Pmsg33Register = 0x16061 * sizeof(UInt32);
 constexpr UInt32 kDriverScratch0Register = 0x94 * sizeof(UInt32);
 constexpr UInt32 kDriverScratch1Register = 0x95 * sizeof(UInt32);
 constexpr UInt32 kDriverScratch2Register = 0x96 * sizeof(UInt32);
@@ -43,6 +45,32 @@ constexpr IOByteCount kPanelSourceBytes =
 // a 128 MiB aperture. The GPU really reports 4 GiB of shared system memory; this
 // is the amount advertised to IOGraphics, not a hardware partition.
 constexpr UInt32 kDefaultVramExposureMiB = 128;
+// OpenCore injects this kext from the boot kernel collection. Opening the PCI
+// provider and touching Van Gogh MMIO there stalls the APU, so hardware work
+// is deferred until well after boot via a thread_call. The delay is not a
+// timeout: it only keeps all GPU access off the boot/PCI-configuration path.
+constexpr UInt64 kDeferredInitDelayMs = 3000;
+// Published before each hardware phase. All of this runs in the deferred
+// worker, so if a future register read ever hangs, ioreg still shows the
+// last phase reached without needing a boot-time bisect.
+enum class HwStage : UInt32 {
+    Opening = 1,
+    Mapped = 2,
+    PspWaiting = 3,
+    PspOpen = 4,
+    VramSize = 5,
+    IpDiscovery = 6,
+    MmhubVmid0 = 7,
+    DcnRotation = 8,
+    DcnTiming = 9,
+    DcnRouting = 10,
+    RotationProgram = 11,
+    VramScanout = 12,
+    LiveScanout = 13,
+    PspFirmware = 14,
+    Complete = 15,
+    Failed = 99
+};
 }
 
 class VanGoghDriver : public IOService {
@@ -90,8 +118,17 @@ private:
                           UInt32 registerDword, UInt32 *value) const;
     bool writeIPRegister32(UInt16 hwId, UInt8 instance, UInt8 segment,
                            UInt32 registerDword, UInt32 value) const;
+    // Deferred bring-up: start() only publishes identity. Hardware work runs
+    // from a thread_call so a gated-register read can never freeze boot.
+    void scheduleDeferredInit(IOService *provider);
+    static void deferredInitTrampoline(thread_call_param_t param0, thread_call_param_t param1);
+    void runDeferredInit();
+    bool readEarlyRegister32(IOByteCount byteOffset, UInt32 *value) const;
 
     IOPCIDevice *m_pciDevice{nullptr};
+    thread_call_t m_deferredInitCall{nullptr};
+    VanGoghInitGate::Result m_initResult{};
+    bool m_hardwareReady{false};
     IOMemoryMap *m_registerMap{nullptr};
     IOLock *m_vramAccessLock{nullptr};
     IOBufferMemoryDescriptor *m_scanoutMemory{nullptr};
@@ -163,6 +200,7 @@ bool VanGoghDriver::start(IOService *provider) {
         return false;
     }
 
+    // These are plain PCI configuration reads and are safe on the boot path.
     const UInt16 vendor = m_pciDevice->configRead16(kIOPCIConfigVendorID);
     const UInt16 device = m_pciDevice->configRead16(kIOPCIConfigDeviceID);
     if (vendor != 0x1002 || device != 0x163F) {
@@ -172,33 +210,95 @@ bool VanGoghDriver::start(IOService *provider) {
         return false;
     }
 
-    // Hardware access is disabled by default: opening the PCI provider and
-    // mapping BAR5 hangs boot on the Steam Deck's Van Gogh APU. Publish the
-    // PCI identity only, unless the caller explicitly opts into the unsafe
-    // hardware path (for future out-of-boot bring-up work).
-    if (!boolProperty(m_pciDevice, "VanGoghDriver,unsafe-hardware-init")) {
-        const UInt8 revision = m_pciDevice->configRead8(kIOPCIConfigRevisionID);
-        setProperty("model", "AMD Van Gogh (Steam Deck) probe-only");
-        setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
-        setProperty("VanGoghDriver,PCI-device-id", device, 32);
-        setProperty("VanGoghDriver,revision-id", revision, 8);
-        setProperty("VanGoghDriver,attached", true);
-        setProperty("VanGoghDriver,probe-only", true);
-        setProperty("VanGoghDriver,identity-only", true);
-        m_pciDevice->setProperty("model", "AMD Van Gogh (Steam Deck) identity only");
-        m_pciDevice->setProperty("VanGoghDriver,attached", true);
-        m_pciDevice->setProperty("VanGoghDriver,identity-only", true);
-        registerService();
-        IOLog("VanGoghDriver: identity-only start succeeded for %04x:%04x rev %02x; hardware init disabled\n",
-              vendor, device, revision);
-        return true;
+    // Boot-path safety. OpenCore injects this kext from the boot kernel
+    // collection. Opening the provider, enabling memory decode, mapping BAR5,
+    // or polling the PSP there stalls the Van Gogh APU. start() therefore does
+    // only identity publication and returns. Hardware bring-up is optional and
+    // runs later from a thread_call (see runDeferredInit).
+    const UInt8 revision = m_pciDevice->configRead8(kIOPCIConfigRevisionID);
+    setProperty("model", "AMD Van Gogh (Steam Deck) identity only");
+    setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
+    setProperty("VanGoghDriver,PCI-device-id", device, 32);
+    setProperty("VanGoghDriver,revision-id", revision, 8);
+    setProperty("VanGoghDriver,attached", true);
+    setProperty("VanGoghDriver,probe-only", true);
+    setProperty("VanGoghDriver,identity-only", true);
+    m_pciDevice->setProperty("model", "AMD Van Gogh (Steam Deck) identity only");
+    m_pciDevice->setProperty("VanGoghDriver,attached", true);
+    m_pciDevice->setProperty("VanGoghDriver,identity-only", true);
+    registerService();
+    IOLog("VanGoghDriver: identity-only start succeeded for %04x:%04x rev %02x; no BAR/GPU access on boot path\n",
+          vendor, device, revision);
+
+    // Opt in after boot with VanGoghDriver,deferred-hardware-init. The old
+    // unsafe-hardware-init property is accepted as an alias but now has the
+    // same deferred, gated behaviour rather than running inside start().
+    if (boolProperty(m_pciDevice, "VanGoghDriver,deferred-hardware-init") ||
+        boolProperty(m_pciDevice, "VanGoghDriver,unsafe-hardware-init")) {
+        scheduleDeferredInit(provider);
+    }
+    return true;
+}
+
+void VanGoghDriver::scheduleDeferredInit(IOService *provider) {
+    (void)provider;
+    if (m_deferredInitCall != nullptr) return;
+    m_deferredInitCall = thread_call_allocate(&VanGoghDriver::deferredInitTrampoline, this);
+    if (m_deferredInitCall == nullptr) {
+        IOLog("VanGoghDriver: could not allocate deferred init thread call\n");
+        setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::Failed), 32);
+        return;
     }
 
-    if (!m_pciDevice->open(this)) {
-        IOLog("VanGoghDriver: could not open PCI provider\n");
-        m_pciDevice = nullptr;
-        IOService::stop(provider);
+    uint64_t now = 0;
+    uint64_t delay = 0;
+    clock_get_uptime(&now);
+    nanoseconds_to_absolutetime(static_cast<uint64_t>(kDeferredInitDelayMs) * 1000000ULL, &delay);
+    setProperty("VanGoghDriver,deferred-init-scheduled", true);
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::Opening), 32);
+    thread_call_enter_delayed(m_deferredInitCall, now + delay);
+    IOLog("VanGoghDriver: hardware init deferred %llu ms off the boot path\n",
+          static_cast<unsigned long long>(kDeferredInitDelayMs));
+}
+
+void VanGoghDriver::deferredInitTrampoline(thread_call_param_t param0, thread_call_param_t param1) {
+    (void)param1;
+    VanGoghDriver *self = static_cast<VanGoghDriver *>(param0);
+    if (self != nullptr) self->runDeferredInit();
+}
+
+// Low-level register read used only by the PSP readiness gate. It bypasses the
+// m_hardwareReady check because that check is what the gate establishes.
+bool VanGoghDriver::readEarlyRegister32(IOByteCount byteOffset, UInt32 *value) const {
+    if (m_registerMap == nullptr || value == nullptr || (byteOffset & 3) != 0 ||
+        byteOffset > m_registerLength || sizeof(UInt32) > m_registerLength - byteOffset) {
         return false;
+    }
+    volatile UInt32 *registers =
+        reinterpret_cast<volatile UInt32 *>(m_registerMap->getVirtualAddress());
+    if (registers == nullptr) return false;
+    *value = registers[byteOffset / sizeof(UInt32)];
+    OSSynchronizeIO();
+    return true;
+}
+
+void VanGoghDriver::runDeferredInit() {
+    if (m_pciDevice == nullptr) return;
+
+    // A failure helper used by every abort path below. No IOService::stop()
+    // from this worker: teardown stays owned by stop().
+    auto fail = [this](const char *reason) {
+        IOLog("VanGoghDriver: deferred hardware init aborted: %s\n", reason);
+        setProperty("VanGoghDriver,hardware-init-failed", true);
+        setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::Failed), 32);
+        m_hardwareReady = false;
+        releaseDeviceResources();
+    };
+
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::Opening), 32);
+    if (!m_pciDevice->open(this)) {
+        fail("could not open PCI provider");
+        return;
     }
     m_providerOpened = true;
 
@@ -207,10 +307,8 @@ bool VanGoghDriver::start(IOService *provider) {
     const UInt32 bar5Register = kIOPCIConfigBaseAddress0 + 5 * sizeof(UInt32);
     IODeviceMemory *bar5 = m_pciDevice->getDeviceMemoryWithRegister(bar5Register);
     if (bar5 == nullptr || bar5->getLength() < sizeof(UInt32)) {
-        IOLog("VanGoghDriver: PCI BAR5 register aperture is unavailable\n");
-        releaseDeviceResources();
-        IOService::stop(provider);
-        return false;
+        fail("PCI BAR5 register aperture unavailable");
+        return;
     }
 
     m_registerPhysicalAddress = bar5->getPhysicalAddress();
@@ -223,29 +321,54 @@ bool VanGoghDriver::start(IOService *provider) {
     m_memoryEnableChanged = !m_memoryEnableWasSet;
     m_registerMap = m_pciDevice->mapDeviceMemoryWithRegister(bar5Register);
     if (m_registerMap == nullptr || m_registerMap->getLength() < m_registerLength) {
-        IOLog("VanGoghDriver: could not map the complete PCI BAR5 register aperture\n");
-        releaseDeviceResources();
-        IOService::stop(provider);
-        return false;
+        fail("could not map the complete PCI BAR5 register aperture");
+        return;
     }
     m_vramAccessLock = IOLockAlloc();
     if (m_vramAccessLock == nullptr) {
-        IOLog("VanGoghDriver: could not allocate VRAM access lock\n");
-        releaseDeviceResources();
-        IOService::stop(provider);
-        return false;
+        fail("could not allocate VRAM access lock");
+        return;
     }
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::Mapped), 32);
 
+    const UInt16 vendor = m_pciDevice->configRead16(kIOPCIConfigVendorID);
+    const UInt16 device = m_pciDevice->configRead16(kIOPCIConfigDeviceID);
     const UInt8 revision = m_pciDevice->configRead8(kIOPCIConfigRevisionID);
-    IOLog("VanGoghDriver: attached to Van Gogh %04x:%04x rev %02x; BAR5 mapped at 0x%llx (%llu bytes)\n",
+    IOLog("VanGoghDriver: deferred attach to Van Gogh %04x:%04x rev %02x; BAR5 at 0x%llx (%llu bytes)\n",
           vendor, device, revision, (unsigned long long)m_registerPhysicalAddress,
           (unsigned long long)m_registerLength);
-    IOLog("VanGoghDriver: GPU initialization and display/compute services are not enabled yet\n");
+
+    // PSP readiness gate. Linux waits for C2PMSG_35 bit 31 before any other
+    // GPU register access, then C2PMSG_33 bit 31 before reading discovery.
+    // Only these two registers are touched before the gate opens; every wait
+    // is bounded. A refusal here means zero additional MMIO reads.
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::PspWaiting), 32);
+    m_initResult = VanGoghInitGate::run(
+        [this](uint32_t regDword, uint32_t *value) -> bool {
+            return readEarlyRegister32(static_cast<IOByteCount>(regDword) * sizeof(UInt32), value);
+        },
+        [](uint32_t ms) { IOSleep(ms); });
+    setProperty("VanGoghDriver,psp-gate-stage",
+                static_cast<UInt32>(VanGoghInitGate::stageCode(m_initResult.stage)), 32);
+    setProperty("VanGoghDriver,psp-bootloader-attempts", m_initResult.bootloaderAttempts, 32);
+    setProperty("VanGoghDriver,psp-ifwi-attempts", m_initResult.ifwiAttempts, 32);
+    if (!m_initResult.ok()) {
+        IOLog("VanGoghDriver: PSP gate %s (bootloader %u, IFWI %u); refusing all further GPU MMIO\n",
+              VanGoghInitGate::stageName(m_initResult.stage),
+              m_initResult.bootloaderAttempts, m_initResult.ifwiAttempts);
+        fail("PSP readiness gate did not open");
+        return;
+    }
+    m_hardwareReady = true;
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::PspOpen), 32);
+    IOLog("VanGoghDriver: PSP gate open after %u/%u polls; hardware access allowed\n",
+          m_initResult.bootloaderAttempts, m_initResult.ifwiAttempts);
 
     m_pciDevice->setProperty("model", "AMD Van Gogh (Steam Deck)");
     m_pciDevice->setProperty("VanGoghDriver,PCI-vendor-id", vendor, 32);
     m_pciDevice->setProperty("VanGoghDriver,PCI-device-id", device, 32);
     m_pciDevice->setProperty("VanGoghDriver,revision-id", revision, 8);
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::VramSize), 32);
     UInt32 vramMegabytes = 0;
     const bool vramSizeValid =
         readRegister32(kRccConfigMemsizeRegister, &vramMegabytes) &&
@@ -268,12 +391,19 @@ bool VanGoghDriver::start(IOService *provider) {
                 (UInt64)m_registerLength, 64);
     setProperty("VanGoghDriver,attached", true);
     m_pciDevice->setProperty("VanGoghDriver,attached", true);
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::IpDiscovery), 32);
     loadIPDiscovery(m_pciDevice);
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::MmhubVmid0), 32);
     inspectVanGoghVMID0();
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::DcnRotation), 32);
     inspectDCN301Rotation();
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::DcnTiming), 32);
     inspectDCN301Timing();
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::DcnRouting), 32);
     inspectDCN301PipeRouting();
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::RotationProgram), 32);
     applyConfiguredDCN301Rotation(m_pciDevice);
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::VramScanout), 32);
     if (boolProperty(m_pciDevice, "VanGoghDriver,vram-scanout")) {
         planVramScanout(m_pciDevice);
         programVramScanout(m_pciDevice);
@@ -281,6 +411,7 @@ bool VanGoghDriver::start(IOService *provider) {
     // The default route: the display engine is already scanning a linear
     // firmware/OpenCore surface. Expose exactly that memory to IOGraphics so
     // WindowServer has a working, unaccelerated framebuffer without any DCN write.
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::LiveScanout), 32);
     if (!framebufferReady()) {
         if (!adoptLiveScanout(m_pciDevice) &&
             !boolProperty(m_pciDevice, "VanGoghDriver,vram-scanout") &&
@@ -288,16 +419,16 @@ bool VanGoghDriver::start(IOService *provider) {
             IOLog("VanGoghDriver: no usable live scanout and no contiguous linear panel buffer; framebuffer remains disabled\n");
         }
     }
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::PspFirmware), 32);
     validatePSPFirmware(m_pciDevice);
     OSData *panelEdid = OSData::withBytes(kSteamDeckPanelEDID, sizeof(kSteamDeckPanelEDID));
     if (panelEdid != nullptr) {
         setProperty("VanGoghFramebuffer,edid", panelEdid);
         panelEdid->release();
     }
-    registerService();
-    IOLog("VanGoghDriver: start completed; PCI identity is published, framebuffer-ready=%d\n",
+    setProperty("VanGoghDriver,hardware-init-stage", static_cast<UInt32>(HwStage::Complete), 32);
+    IOLog("VanGoghDriver: deferred hardware init completed; framebuffer-ready=%d\n",
           framebufferReady() ? 1 : 0);
-    return true;
 }
 
 // Capture MMHUB 2.3 VMID0's live page-table and aperture state. The registers
@@ -1088,7 +1219,18 @@ void VanGoghDriver::validatePSPFirmware(IOService *provider) {
 }
 
 void VanGoghDriver::stop(IOService *provider) {
+    // Cancel a pending worker and wait for an in-flight one before releasing
+    // the state it uses. Without this, stop() could free BAR5/IP tables while
+    // the worker is still polling or writing registers (use-after-free/panic).
+    if (m_deferredInitCall != nullptr) {
+        thread_call_cancel_wait(m_deferredInitCall);
+        thread_call_free(m_deferredInitCall);
+        m_deferredInitCall = nullptr;
+    }
+    // Release while the gate is still open so rotation/scanout state can be
+    // restored with real register writes, then close it for good.
     releaseDeviceResources();
+    m_hardwareReady = false;
     IOService::stop(provider);
 }
 
@@ -1175,17 +1317,9 @@ void VanGoghDriver::loadIPDiscovery(IOService *provider) {
         IOLog("VanGoghDriver: supplied IP discovery blob rejected; trying live TMR\n");
     }
 
-    UInt32 ready = 0;
-    for (UInt32 i = 0; i < 2000; ++i) {
-        if (!readRegister32(kMp0C2Pmsg33Register, &ready)) break;
-        if (ready & 0x80000000u) break;
-        IOSleep(1);
-    }
-    if ((ready & 0x80000000u) == 0) {
-        IOLog("VanGoghDriver: PSP IFWI-ready bit not set; skipping TMR discovery read\n");
-        return;
-    }
-
+    // The PSP readiness gate already waited for C2PMSG_35 (bootloader) and
+    // C2PMSG_33 (IFWI init) with bounded polls before any other MMIO access.
+    // Do not sleep or re-poll here; a second timeout would hide a gate bug.
     UInt32 vramMegabytes = 0;
     if (!readRegister32(kRccConfigMemsizeRegister, &vramMegabytes) ||
         vramMegabytes == 0 || vramMegabytes == 0xffffffffu ||
@@ -1285,8 +1419,11 @@ bool VanGoghDriver::parseIPDiscovery(const UInt8 *data, IOByteCount length) {
 }
 
 bool VanGoghDriver::readRegister32(IOByteCount byteOffset, UInt32 *value) const {
-    if (value == nullptr || m_registerMap == nullptr || (byteOffset & 3) != 0 ||
-        byteOffset > m_registerLength || sizeof(UInt32) > m_registerLength - byteOffset) {
+    // No GPU MMIO outside the deferred worker's opened gate. The gate itself
+    // uses readEarlyRegister32(), which does not carry this check.
+    if (!m_hardwareReady || value == nullptr || m_registerMap == nullptr ||
+        (byteOffset & 3) != 0 || byteOffset > m_registerLength ||
+        sizeof(UInt32) > m_registerLength - byteOffset) {
         return false;
     }
 
@@ -1298,7 +1435,9 @@ bool VanGoghDriver::readRegister32(IOByteCount byteOffset, UInt32 *value) const 
 }
 
 bool VanGoghDriver::writeRegister32(IOByteCount byteOffset, UInt32 value) const {
-    if (m_registerMap == nullptr || (byteOffset & 3) != 0 ||
+    // Same gate as reads. No DCN/MMHUB register can be written before the PSP
+    // readiness gate has opened, and none can be written during teardown.
+    if (!m_hardwareReady || m_registerMap == nullptr || (byteOffset & 3) != 0 ||
         byteOffset > m_registerLength || sizeof(UInt32) > m_registerLength - byteOffset) {
         return false;
     }

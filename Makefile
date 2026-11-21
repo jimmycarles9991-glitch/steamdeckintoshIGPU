@@ -5,11 +5,16 @@ CXXFLAGS ?= -std=gnu++14 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefin
 BUILD := build/host
 LOGIC := Kext/VanGoghMemoryPlan.cpp Kext/VanGoghScanout.cpp Kext/VanGoghDCN301.cpp
 
-.PHONY: test verify-registers compile-check clean-host
-test: $(BUILD)/memory_plan_test $(BUILD)/scanout_test
+.PHONY: test verify-registers compile-check fetch-linux-ref clean-host
+test: $(BUILD)/memory_plan_test $(BUILD)/scanout_test $(BUILD)/init_gate_test
 	$(BUILD)/memory_plan_test
 	$(BUILD)/scanout_test
+	$(BUILD)/init_gate_test
 	python3 tests/tools/test_hubp_dump.py
+
+$(BUILD)/init_gate_test: tests/host/init_gate_test.cpp Kext/VanGoghInitGate.h tests/host/check.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) tests/host/init_gate_test.cpp -o $@
 
 $(BUILD)/memory_plan_test: tests/host/memory_plan_test.cpp Kext/VanGoghMemoryPlan.cpp Kext/VanGoghMemoryPlan.h tests/host/check.h
 	@mkdir -p $(BUILD)
@@ -29,3 +34,7 @@ clean-host:
 # Compile the kext sources for macOS with a bundled clang (see the script header).
 compile-check:
 	tools/compile_check_kext.sh
+
+# Download the exact Linux amdgpu sources used to derive the readiness gate.
+fetch-linux-ref:
+	tools/fetch_linux_amdgpu.sh

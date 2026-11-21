@@ -57,6 +57,8 @@ The live sysfs discovery directory reports `num_ips = 36`. RedNavi's helper emit
 
 `SOC15_REG_OFFSET` in [`soc15_common.h`](https://github.com/gregkh/linux/blob/v6.18.44/drivers/gpu/drm/amd/amdgpu/soc15_common.h) computes `discovery_base[BASE_IDX] + register_dword`. Linux's [`amdgpu_device_rreg`](https://github.com/gregkh/linux/blob/v6.18.44/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c) treats that result as a dword offset, reads BAR-mapped MMIO when its byte offset is less than `rmmio_size`, and otherwise uses a PCIe register accessor. This is why BAR bounds must be checked after adding the base and register offset, and why an out-of-BAR result cannot be made safe by simply mapping BAR5.
 
+The same source trace exposed a correctness bug in the kext's readiness check. `amdgpu_discovery.c` waits on `mmMP0_SMN_C2PMSG_33` (dword `0x16061`) bit 31 for IFWI init before reading the TMR; that is what the kext copied. But `psp_v11_0_wait_for_bootloader()` in `psp_v11_0.c` waits on `mmMP0_SMN_C2PMSG_35` (dword `0x16063`) with mask `0x8000FFFF` expecting `0x80000000`, and `amdgpu_device_asic_init()` runs that wait before any IP `hw_init`. The kext never checked `C2PMSG_35`, so it could touch DCN/MMHUB MMIO before the PSP bootloader was ready. `Kext/VanGoghInitGate.h` now implements both waits in that order with bounded polls derived from Linux's `psp_wait_for()` (1 s) and discovery (2 s), and the worker grants normal MMIO access only after both pass. Since boot-time BAR5 access itself stalls the APU, all of this work is deferred out of `start()` into a `thread_call`; `stop()` cancels/waits for that worker before releasing device state.
+
 ## Built-in display
 
 - Linux DRM connector: `eDP-1`, connected and enabled.
