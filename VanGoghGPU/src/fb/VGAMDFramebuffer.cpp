@@ -31,8 +31,8 @@ static const char *bootArgs(void) {
 }
 
 IOService *VGAMDFramebuffer::probe(IOService *provider, SInt32 *score) {
-    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
-    if (!pci) return nullptr;
+    IOPCIDevice *pciDev = OSDynamicCast(IOPCIDevice, provider);
+    if (!pciDev) return nullptr;
     const char *args = bootArgs();
     if (vg_arg_has(args, "-vgfboff")) {
         LOG("-vgfboff present; declining");
@@ -42,8 +42,8 @@ IOService *VGAMDFramebuffer::probe(IOService *provider, SInt32 *score) {
         LOG("not armed; add -vgfbown to boot-args");
         return nullptr;
     }
-    if (pci->configRead16(kIOPCIConfigVendorID) != 0x1002 ||
-        pci->configRead16(kIOPCIConfigDeviceID) != 0x163f)
+    if (pciDev->configRead16(kIOPCIConfigVendorID) != 0x1002 ||
+        pciDev->configRead16(kIOPCIConfigDeviceID) != 0x163f)
         return nullptr;
     if (score) *score = 30000;   /* above IONDRVFramebuffer's 20000 */
     LOG("armed; claiming display at score %d", score ? *score : -1);
@@ -66,9 +66,10 @@ bool VGAMDFramebuffer::start(IOService *provider) {
     if (vg_arg_u32(args, "vgfb-hz", &v)) mode->hz = v;
     if (vg_arg_u32(args, "vgfb-stride", &v)) mode->stride = v;
     uint32_t offset = 0;
-    uint32_t aperture = 0;
+    uint32_t apertureBytes = 0;
     (void)vg_arg_u32(args, "vgfb-offset", &offset);
-    if (vg_arg_u32(args, "vgfb-aperture", &aperture) == 0) mode->aperture_bytes = aperture;
+    if (vg_arg_u32(args, "vgfb-aperture", &apertureBytes) == 0)
+        mode->aperture_bytes = apertureBytes;
     if (vg_mode_build(mode->width, mode->height, mode->hz, mode->stride, 0, mode) != 0) {
         LOG("bad geometry; using panel defaults");
         vg_mode_default(mode);
