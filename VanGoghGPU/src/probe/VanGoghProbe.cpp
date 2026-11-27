@@ -7,7 +7,7 @@ extern "C" {
 }
 
 #include <IOKit/IOLib.h>
-#include <IOKit/IOMemoryMap.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSNumber.h>
