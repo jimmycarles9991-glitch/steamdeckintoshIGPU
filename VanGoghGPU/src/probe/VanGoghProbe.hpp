@@ -32,7 +32,7 @@ private:
     uint32_t rd(uint32_t dw) const;
     void wr(uint32_t dw, uint32_t value) const;
     bool mmRead(uint64_t pos, uint8_t *dst, uint32_t len) const;
-    void publish(const struct vg_disc *disc, uint32_t memsize) const;
+    void publish(const struct vg_disc *disc, uint32_t memsize);
 };
 
 #endif

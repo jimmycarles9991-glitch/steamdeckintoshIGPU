@@ -25,12 +25,12 @@ static void setNum(IOService *s, const char *key, uint64_t v) {
 }
 
 IOService *VanGoghProbe::probe(IOService *provider, SInt32 *score) {
-    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
-    if (!pci) return nullptr;
-    uint16_t v = pci->configRead16(kIOPCIConfigVendorID);
-    uint16_t d = pci->configRead16(kIOPCIConfigDeviceID);
+    IOPCIDevice *pciDev = OSDynamicCast(IOPCIDevice, provider);
+    if (!pciDev) return nullptr;
+    uint16_t v = pciDev->configRead16(kIOPCIConfigVendorID);
+    uint16_t d = pciDev->configRead16(kIOPCIConfigDeviceID);
     LOG("probe vendor=%04x device=%04x rev=%02x",
-        v, d, pci->configRead8(kIOPCIConfigRevisionID));
+        v, d, pciDev->configRead8(kIOPCIConfigRevisionID));
     if (v != 0x1002 || d != 0x163f) return nullptr;
     if (score) *score = 40000;
     return IOService::probe(provider, score);
@@ -168,7 +168,7 @@ bool VanGoghProbe::mmRead(uint64_t pos, uint8_t *dst, uint32_t len) const {
     return true;
 }
 
-void VanGoghProbe::publish(const struct vg_disc *d, uint32_t memsize) const {
+void VanGoghProbe::publish(const struct vg_disc *d, uint32_t memsize) {
     setNum(this, "VGDiscoveryBinMajor", d->bin_major);
     setNum(this, "VGDiscoveryBinMinor", d->bin_minor);
     setNum(this, "VGDiscoveryIPVersion", d->ip_version);
