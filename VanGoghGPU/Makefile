@@ -67,9 +67,11 @@ $(BUILD_DIR)/probe/VanGoghProbe.o: src/probe/VanGoghProbe.cpp src/probe/VanGoghP
 probe: $(PROBE_BUNDLE)/Contents/MacOS/VanGoghProbe
 $(PROBE_BUNDLE)/Contents/MacOS/VanGoghProbe: $(PROBE_OBJS) src/probe/Info.plist
 	mkdir -p $(PROBE_BUNDLE)/Contents/MacOS
-	$(KCXX) -arch x86_64 -mmacosx-version-min=13.0 -nostdlib -static \
-		-o $@ $(PROBE_OBJS) -lkmod -lcpp_lib
+	$(KCXX) -arch x86_64 -mmacosx-version-min=13.0 -isysroot $(SDK) -nostdlib \
+		-Xlinker -kext -L$(MKSDK)/Library/x86_64 \
+		-o $@ $(PROBE_OBJS) -lkmod
 	cp src/probe/Info.plist $(PROBE_BUNDLE)/Contents/Info.plist
+	codesign --force --sign - $(PROBE_BUNDLE) 2>/dev/null || true
 
 # --- framebuffer kext -----------------------------------------------------
 FB_BUNDLE := $(OUT)/VGAMDFramebuffer.kext
@@ -96,9 +98,11 @@ $(BUILD_DIR)/fb/common_bootargs.o: $(COMMON)/vg_bootargs.c $(COMMON_HDRS)
 fb: $(FB_BUNDLE)/Contents/MacOS/VGAMDFramebuffer
 $(FB_BUNDLE)/Contents/MacOS/VGAMDFramebuffer: $(FB_OBJS) src/fb/Info.plist
 	mkdir -p $(FB_BUNDLE)/Contents/MacOS
-	$(KCXX) -arch x86_64 -mmacosx-version-min=13.0 -nostdlib -static \
-		-o $@ $(FB_OBJS) -lkmod -lcpp_lib
+	$(KCXX) -arch x86_64 -mmacosx-version-min=13.0 -isysroot $(SDK) -nostdlib \
+		-Xlinker -kext -L$(MKSDK)/Library/x86_64 \
+		-o $@ $(FB_OBJS) -lkmod
 	cp src/fb/Info.plist $(FB_BUNDLE)/Contents/Info.plist
+	codesign --force --sign - $(FB_BUNDLE) 2>/dev/null || true
 
 clean:
 	rm -rf $(BUILD_DIR)
