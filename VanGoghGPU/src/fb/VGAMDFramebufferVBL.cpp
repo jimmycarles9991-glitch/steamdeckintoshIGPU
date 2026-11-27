@@ -6,6 +6,11 @@
  * duration does not accumulate into the refresh period.
  */
 #include "VGAMDFramebuffer.hpp"
+
+extern "C" {
+#include "vg_modes.h"
+}
+
 #include <mach/mach_time.h>
 
 #define LOG(fmt, ...) IOLog("VGAMDFramebuffer: " fmt "\n", ##__VA_ARGS__)

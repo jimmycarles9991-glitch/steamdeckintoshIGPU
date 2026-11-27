@@ -64,10 +64,10 @@ UInt64 VGAMDFramebuffer::getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex)
 }
 
 IOReturn VGAMDFramebuffer::getPixelInformation(IODisplayModeID displayMode, IOIndex depth,
-                                                IOPixelAperture aperture,
+                                                IOPixelAperture fbAperture,
                                                 IOPixelInformation *info) {
     if (!info || displayMode != kModeID || depth != 0 ||
-        aperture != kIOFBSystemAperture || !mode)
+        fbAperture != kIOFBSystemAperture || !mode)
         return kIOReturnBadArgument;
     info->bytesPerRow = mode->stride;
     info->bytesPerPlane = mode->aperture_bytes;
