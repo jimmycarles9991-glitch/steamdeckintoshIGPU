@@ -100,23 +100,23 @@ static void test_vfct(void) {
 static void test_modes(void) {
     struct vg_mode m;
     vg_mode_default(&m);
-    CHECK(m.width == 1280 && m.height == 800);
-    CHECK(m.stride == 5120);
-    CHECK(m.aperture_bytes == 1280u * 4u * 800u);
+    CHECK(m.width == 800 && m.height == 1280);
+    CHECK(m.stride == 3200);
+    CHECK(m.aperture_bytes == 800u * 4u * 1280u);
     CHECK(vg_refresh_1616(&m) == (60u << 16));
 
     uint8_t edid[18];
     memset(edid, 0, sizeof(edid));
     put16(edid, 8019);       /* 80.19 MHz in 10 kHz units */
-    edid[2] = 0x00; edid[3] = 0x72; edid[4] = 0x51;   /* 1280 + 370 blank */
-    edid[5] = 0x20; edid[6] = 0x0a; edid[7] = 0x30;   /* 800 + 10 blank */
+    edid[2] = 0x20; edid[3] = 0xf0; edid[4] = 0x30;   /* 800 + 240 blank */
+    edid[5] = 0x00; edid[6] = 0x0a; edid[7] = 0x50;   /* 1280 + 10 blank */
     edid[8] = 48; edid[9] = 40; edid[10] = 0x06; edid[11] = 0x00;
     struct vg_mode em;
     CHECK(vg_mode_from_edid(edid, &em) == 0);
-    CHECK(em.width == 1280);
-    CHECK(em.height == 800);
+    CHECK(em.width == 800);
+    CHECK(em.height == 1280);
     CHECK(em.pixel_clock_hz == 80190000u);
-    CHECK(em.h_total == 1650 && em.v_total == 810);
+    CHECK(em.h_total == 1040 && em.v_total == 1290);
 }
 
 static void test_args(void) {

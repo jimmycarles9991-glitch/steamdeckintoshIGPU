@@ -15,7 +15,7 @@ Load the probe kext. Run `tools/collect.sh` under Linux. Record:
 - the exact macOS version and OpenCore version
 
 Nothing in P1 is trusted until these exist. In particular, the framebuffer
-offset and stride are *not* assumed to be 0 / 5120 without a measurement.
+offset and stride are *not* assumed to be 0 / 3200 without a measurement.
 
 ## P1 — A picture (exit: CPU-composited desktop at native size)
 

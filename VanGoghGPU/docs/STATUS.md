@@ -7,7 +7,7 @@ Last updated: 2026-11-27. No hardware testing has been performed by the author.
 - IP-discovery binary parser (v1–v4, 32/64-bit bases, checksum flags).
 - VFCT VBIOS table parser.
 - Boot-argument parser (`-vgfboff`, `-vgfbown`, `vgfb-*` values).
-- Panel mode table and timing arithmetic (1280×800@60 default, EDID-derived
+- Panel mode table and timing arithmetic (native 800×1280@60 portrait default, EDID-derived
   overrides).
 - `make hosttest` on Linux and macOS, with ASan/UBSan where available.
 
@@ -26,6 +26,8 @@ Last updated: 2026-11-27. No hardware testing has been performed by the author.
 ## Not implemented
 
 - Any DCN modeset, link training, PLL programming or DMCUB loading.
+- Screen rotation: the panel is natively 800×1280 portrait; this kext does not
+  rotate it to landscape.
 - Backlight control (the GOP's setting is left alone).
 - Cursor plane, gamma correctness, display sleep/wake, hotplug, external DP.
 - Metal, OpenGL, OpenCL, video decode, GFX/SDMA ring bring-up.
@@ -45,7 +47,7 @@ Last updated: 2026-11-27. No hardware testing has been performed by the author.
    Check `ioreg -rc IOFramebuffer` after booting with `-vgfboff`.
 3. **VBL is a timer, not the real OTG interrupt.** It will drift under load.
    It is needed for WindowServer to drain its transaction queue.
-4. **Mode timing.** 1280×800@60 is the LCD spec. The EDID may report a
+4. **Mode timing.** 800×1280@60 portrait is the LCD spec. The EDID may report a
    different blanking interval; `tools/collect.sh` extracts it.
 5. **`unregisterInterrupt`** uses a simple slot table of four; no dynamic
    allocation in interrupt context.
@@ -59,7 +61,8 @@ ioreg -rc VGAMDFramebuffer     # one instance, provider is the 1002:163f PCI dev
 log show --last boot | grep VGAMD  # aperture, BAR0, IP versions, VFCT status
 ```
 
-and the desktop appears at native resolution, drawn by CPU. If the screen is
+and the desktop appears at native portrait geometry, drawn by CPU and **not
+rotated**. If the screen is
 frozen, reboot with `-vgfboff` and read the logs; do not debug from a black
 screen.
 

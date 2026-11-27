@@ -3,13 +3,13 @@
 **Display bring-up for the Steam Deck LCD's VanGogh iGPU on macOS.**
 
 Target: `1002:163f` (AMD Custom GPU 0405, VanGogh, RDNA2 / GC 10.3.x / DCN 3.0.1),
-1280×800 eDP panel, booted through OpenCore.
+native 800×1280 portrait eDP panel (not rotated by this project), booted through OpenCore.
 
 > **Read this before installing anything.** This is a research project, not a
 > finished driver. As of this commit it contains a read-only probe kext and a
 > *first attempt* at a framebuffer kext that takes over the firmware-lit GOP
-> scanout. It has **no Metal, no OpenGL, no 3D acceleration, and no video
-> decode**. It has never been booted on real hardware by the author (who does
+> scanout. It has **no Metal, no OpenGL, no 3D acceleration, no video decode,
+> and no screen rotation**. It has never been booted on real hardware by the author (who does
 > not own a Deck). Treat every claim here as a hypothesis to be tested. See
 > [docs/STATUS.md](docs/STATUS.md) for exactly what is and is not implemented.
 

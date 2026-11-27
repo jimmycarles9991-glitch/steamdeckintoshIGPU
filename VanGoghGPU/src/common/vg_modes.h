@@ -16,9 +16,9 @@ struct vg_mode {
     uint32_t aperture_bytes;    /* stride * height */
 };
 
-/* Steam Deck LCD panel nominal values. */
-#define VG_PANEL_WIDTH   1280u
-#define VG_PANEL_HEIGHT  800u
+/* Steam Deck LCD is a native 800x1280 portrait panel. Rotation is not done here. */
+#define VG_PANEL_WIDTH   800u
+#define VG_PANEL_HEIGHT  1280u
 #define VG_PANEL_HZ      60u
 #define VG_BYTES_PER_PIXEL 4u
 

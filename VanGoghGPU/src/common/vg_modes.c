@@ -7,10 +7,10 @@ void vg_mode_default(struct vg_mode *m) {
     m->height = VG_PANEL_HEIGHT;
     m->hz = VG_PANEL_HZ;
     m->stride = VG_PANEL_WIDTH * VG_BYTES_PER_PIXEL;
-    /* CEA-861-ish blanking for 1280x800@60: htotal 1650, vtotal 810. */
-    m->h_total = 1650; m->v_total = 810;
+    /* Nominal blanking for 800x1280@60: htotal 1040, vtotal 1290 (~80.5 MHz). */
+    m->h_total = 1040; m->v_total = 1290;
     m->h_sync = 40; m->v_sync = 6;
-    m->pixel_clock_hz = 1650u * 810u * VG_PANEL_HZ; /* 80.19 MHz */
+    m->pixel_clock_hz = 1040u * 1290u * VG_PANEL_HZ;
     m->aperture_bytes = m->stride * m->height;
 }
 

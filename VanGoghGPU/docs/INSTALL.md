@@ -42,12 +42,14 @@ Replace `-vgfboff` with `-vgfbown` in boot-args. Optional overrides:
 
 | boot-arg | default | meaning |
 | --- | --- | --- |
-| `vgfb-width=1280` | 1280 | active pixels |
-| `vgfb-height=800` | 800 | active lines |
+| `vgfb-width=800` | 800 | active pixels (native portrait) |
+| `vgfb-height=1280` | 1280 | active lines |
 | `vgfb-hz=60` | 60 | refresh, used for the timer VBL |
-| `vgfb-stride=5120` | width×4 | bytes per row |
+| `vgfb-stride=3200` | width×4 | bytes per row |
 | `vgfb-offset=0` | 0 | byte offset into BAR0 where the scanout lives |
 | `vgfb-aperture=4096000` | stride×height | mapped aperture size |
+
+This kext does not rotate the panel; expect native 800×1280 portrait.
 
 If the screen shows garbage, the offset/stride is wrong. Reboot with
 `-vgfboff` and try another value; no rebuild is needed.

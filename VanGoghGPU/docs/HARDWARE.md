@@ -19,7 +19,7 @@ tree. Nothing in this file is guessed.
 | SDMA | 5.2 (`sdma_v5_2.c`, `vangogh_sdma.bin`) | `drivers/gpu/drm/amd/amdgpu/sdma_v5_2.c:52` |
 | Display firmware | `amdgpu/vangogh_dmcub.bin` | `drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c:124` |
 | SMU | DCN301 SMU (`clk_mgr/dcn301/dcn301_smu.c`) | `drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/` |
-| Panel (LCD model) | 1280×800 eDP, 60 Hz | Valve spec; confirm with `tools/collect.sh` |
+| Panel (LCD model) | native 800×1280 portrait eDP, 60 Hz | Valve spec; confirm with `tools/collect.sh` |
 | Memory | 16 GB LPDDR5 shared (APU), GPU carveout set by BIOS | Valve spec; measure with the probe |
 
 ## Why DCN 3.0.1 matters
